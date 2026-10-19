@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# API sample responses (contain customer and bank data)
+sample_*.json
+output/
+output_ng/
+test.py
+extract.py
+app.py
+# Local scratch scripts
+app.py
+extract.py
+test.py
