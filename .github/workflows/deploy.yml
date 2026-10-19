@@ -1,0 +1,82 @@
+name: Deploy
+
+# Runs after CI passes on main, or by hand from the Actions tab (Run workflow).
+# Glue jobs read their script from S3 on every run, so uploading the script is the deploy; the jobs' saved
+# parameters (--COPY_ROLE_ARN, --additional-python-modules ...) are left as they are.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # GitHub signs in to AWS with OIDC, no stored keys
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  DEPLOY_ROLE: arn:aws:iam::655103423742:role/github-deploy
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # deploy exactly the commit CI tested
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Check everything before changing anything, so a bad setting can't leave half the pipeline deployed
+      - name: Pre-flight checks
+        run: |
+          set -euo pipefail
+          for job in coldstone-extract-ng coldstone-extract-ky coldstone-load-ng coldstone-load-ky; do
+            path=$(aws glue get-job --job-name "$job" --query 'Job.Command.ScriptLocation' --output text)
+            [[ "$path" == s3://* ]] || { echo "::error::$job has no S3 script path ($path)"; exit 1; }
+            echo "$job -> $path"
+          done
+          for fn in coldstone-teams-notifier coldstone-load-dispatcher; do
+            handler=$(aws lambda get-function-configuration --function-name "$fn" --query Handler --output text)
+            if [[ "$handler" != "handler.lambda_handler" ]]; then
+              echo "::error::$fn's handler is '$handler'. Set it to handler.lambda_handler (Code tab > Runtime settings > Edit), or the uploaded code won't be found"
+              exit 1
+            fi
+            echo "$fn handler OK"
+          done
+
+      - name: Upload Glue scripts
+        run: |
+          set -euo pipefail
+          deploy() {  # deploy <glue job> <script in this repo>
+            path=$(aws glue get-job --job-name "$1" --query 'Job.Command.ScriptLocation' --output text)
+            aws s3 cp "$2" "$path"
+            echo "$1: $2 -> $path"
+          }
+          deploy coldstone-extract-ng extract_prod_ng.py
+          deploy coldstone-extract-ky extract_prod_ky.py
+          deploy coldstone-load-ng    load_redshift.py
+          deploy coldstone-load-ky    load_redshift.py
+
+      - name: Deploy Lambdas
+        run: |
+          set -euo pipefail
+          deploy() {  # deploy <lambda function> <folder under lambda/>
+            zip -j "$2.zip" "lambda/$2/handler.py"
+            aws lambda update-function-code --function-name "$1" --zip-file "fileb://$2.zip" \
+              --query '[FunctionName, CodeSha256]' --output text
+            aws lambda wait function-updated --function-name "$1"
+            echo "$1: updated"
+          }
+          deploy coldstone-teams-notifier  teams_notifier
+          deploy coldstone-load-dispatcher load_dispatcher

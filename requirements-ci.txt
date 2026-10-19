@@ -1,0 +1,8 @@
+# Packages the CI checks need. The pipeline scripts themselves run on AWS Glue (Python shell 3.9) and Lambda,
+# which provide their own boto3 / requests / pyarrow; boto3 matches the load jobs' --additional-python-modules.
+boto3==1.35.99
+requests==2.32.3
+pyarrow==17.0.0; python_version < "3.10"   # last release with Python 3.9 wheels (Glue)
+pyarrow==22.0.0; python_version >= "3.10"
+pytest==8.3.3
+ruff==0.6.9

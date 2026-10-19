@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 = AWS Glue Python shell (extract and load jobs); 3.14 = the Lambdas
+        python: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install CI packages
+        run: pip install -r requirements-ci.txt
+
+      - name: Syntax check (compile every deployed script)
+        run: python -m py_compile extract_prod.py extract_prod_ng.py extract_prod_ky.py load_redshift.py lambda/*/handler.py
+
+      - name: Lint (undefined names, unused imports, syntax errors)
+        run: ruff check --select E9,F --target-version py39 --output-format github extract_prod.py extract_prod_ng.py extract_prod_ky.py load_redshift.py lambda tests
+
+      - name: Tests
+        run: pytest -v tests
