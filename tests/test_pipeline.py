@@ -153,3 +153,61 @@ def test_notifier_builds_extract_cards(monkeypatch, msg):
     notifier.lambda_handler({"Records": [{"Sns": {"Message": json.dumps(msg), "Subject": "x"}}]}, None)
     assert len(posted) == 1
     json.dumps(posted[0])  # the card must be valid JSON for Teams
+
+
+def fake_columns():
+    cols = {t: ["external_id", "name"] for t in loader.UPSERT_TABLES}
+    cols.update({t: [fk, "name"] for t, (fk, _) in loader.CHILDREN.items()})
+    return cols, {t: {c: "character varying" for c in cs} for t, cs in cols.items()}
+
+
+def test_child_changes_follow_merge_order():
+    cols, types = fake_columns()
+    merge = loader.merge_sql("ng", cols, types)
+    assert len(merge) <= loader.MAX_BATCH
+    # ResultRows = the statement's position, so each count shows which statement it was read from
+    changes = loader.child_changes({"SubStatements": [{"ResultRows": i} for i in range(len(merge))]})
+    for table, c in changes.items():
+        assert merge[c["removed"]].startswith("DELETE FROM") and f'."{table}"' in merge[c["removed"]]
+        assert merge[c["new"]].startswith("INSERT INTO") and f'."{table}"' in merge[c["new"]]
+    assert loader.child_changes({"SubStatements": [{"ResultRows": -1}]})["order_items"] == \
+        {"new": 0, "updated": 0, "removed": 0}
+
+
+def test_counts_sql_covers_every_table():
+    sql = loader.counts_sql("ng")
+    assert sql.count("UNION ALL") == len(loader.TABLES) - 1
+    assert all(f"'{t}'" in sql for t in loader.TABLES)
+
+
+def test_load_stages_every_table_and_reports_changes(monkeypatch):
+    staged, published = [], []
+
+    class FakeRedshift:
+        def __init__(self, *_):
+            pass
+
+        def columns(self, cc):
+            return fake_columns()
+
+        def run(self, statements, label):
+            if "-stage-" in label:
+                staged.append(label.rsplit("-stage-", 1)[1])
+            return {"SubStatements": [{"ResultRows": 1} for _ in statements]}
+
+        def query(self, sql, label):
+            if label.endswith("-counts"):
+                return [[t, 5] for t in loader.TABLES]
+            if label.endswith("-changes"):
+                return [[t, "2", "1"] for t in loader.UPSERT_TABLES]
+            raise RuntimeError("no KPIs in this test")
+
+    monkeypatch.setattr(loader, "Redshift", FakeRedshift)
+    monkeypatch.setattr(loader, "publish", lambda *a, **kw: published.append(kw))
+    args = loader.load_settings(["--COUNTRY", "ng", "--S3_BUCKET", "b", "--REDSHIFT_WORKGROUP", "w"])
+    loader.load(args, loader.datetime(2026, 10, 20))
+    assert sorted(staged) == sorted(loader.TABLES)
+    result = published[0]
+    assert result["rows_checked"] == 5 * len(loader.TABLES)
+    assert result["changes"] == {"new": 2 * len(loader.UPSERT_TABLES) + len(loader.CHILDREN),
+                                 "updated": len(loader.UPSERT_TABLES), "removed": len(loader.CHILDREN)}

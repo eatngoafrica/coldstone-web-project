@@ -22,16 +22,17 @@ Normally the dispatcher (lambda/load_dispatcher) starts this job when an extract
 hand with --date.
 
 Steps:
-  1. stage    for each table: recreate <base>_staging.<table> with <base>_analytics' columns minus loaded_at, then
-              COPY that date's Parquet folder in.
+  1. stage    for each table (a few at a time): recreate <base>_staging.<table> with <base>_analytics' columns minus
+              loaded_at, then COPY that date's Parquet folder in.
   2. compare  rows identical to analytics (same values, by row fingerprint) are dropped from staging, and the new /
-              updated / removed rows are counted. Reference data (menu, staff...) is in every day's files in full,
-              but only what actually changed gets written.
+              updated rows of the tables with an external_id are counted. Reference data (menu, staff...) is in
+              every day's files in full, but only what actually changed gets written.
   3. merge    one transaction, so reports never see a half-loaded day:
                 * tables with an external_id: new rows inserted, changed rows updated (MERGE); unchanged rows untouched
                 * child / link tables are synced per parent in the files: rows no longer present are removed, rows
                   not yet present are added (e.g. a line removed from an order disappears)
-              loaded_at is set only on rows actually written, so it shows when a record last changed.
+              loaded_at is set only on rows actually written, so it shows when a record last changed. The child
+              tables' added / removed counts are read from the merge's own row counts, so they aren't hashed twice.
               Records that drop out of a full list (e.g. a deleted menu item) are kept in the main tables as history.
   4. report   reads a few basic KPIs for the business date from <base>_analytics and publishes them with a
               "loaded and ready" message. A failed load publishes the error instead (analytics is unchanged).
@@ -41,6 +42,7 @@ SQL runs through the Redshift Data API as the job's IAM role (database user "IAM
 no database password. Column lists are read from Redshift itself, so this script has no other project imports.
 """
 import sys, json, time, argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import boto3
 
@@ -73,6 +75,9 @@ CHILDREN = {
 TABLES = UPSERT_TABLES + list(CHILDREN)
 POLL_SECONDS = 2
 MAX_BATCH = 40
+# Tables staged at once. Each has its own staging table and S3 folder, so they don't conflict; kept small so the
+# Data API and the workgroup aren't flooded with concurrent statements.
+STAGE_WORKERS = 4
 # A busy Redshift queues work rather than rejecting it, but a few errors are temporary: Data API throttling,
 # too many statements at once, a concurrent transaction on the same table, a brief service or connection blip.
 # Each step is one all-or-nothing transaction, so it is retried after a growing wait; anything else fails at once.
@@ -146,24 +151,30 @@ def prune_sql(cc, table, columns, types):
             f"AND {row_hash(source, values, types[table])} = {row_hash(target, values, types[table])}")
 
 
-def changes_sql(cc, columns, types):
-    # One read-only query giving, per table, how many rows the merge will add, update and remove
+def counts_sql(cc):
+    # Row count of every staging table in one query, rather than a round trip per table
+    return " UNION ALL ".join(f"SELECT '{table}', COUNT(*) FROM {STAGING[cc]}.{q(table)}" for table in TABLES)
+
+
+def changes_sql(cc):
+    # One read-only query giving, per table with an external_id, how many rows the merge will add and update.
+    # Staging is already pruned to new and changed rows, so this is a cheap join. The child tables' counts come
+    # from the merge itself (see child_changes), so their rows aren't fingerprinted twice.
     parts = []
     for table in UPSERT_TABLES:
         source, target = f"{STAGING[cc]}.{q(table)}", f"{TARGET[cc]}.{q(table)}"
         parts.append(f"SELECT '{table}', SUM(CASE WHEN t.external_id IS NULL THEN 1 ELSE 0 END), "
-                     f"SUM(CASE WHEN t.external_id IS NULL THEN 0 ELSE 1 END), 0 "
+                     f"SUM(CASE WHEN t.external_id IS NULL THEN 0 ELSE 1 END) "
                      f"FROM {source} s LEFT JOIN {target} t ON t.external_id = s.external_id")
-    for table, (fk, parent) in CHILDREN.items():
-        cols, ty = columns[table], types[table]
-        source, target = f"{STAGING[cc]}.{q(table)}", f"{TARGET[cc]}.{q(table)}"
-        in_run = f"t.{q(fk)} IN (SELECT external_id FROM {ids_table(cc, parent)})"
-        parts.append(f"SELECT '{table}', a.n, 0, r.n FROM "
-                     f"(SELECT COUNT(*) AS n FROM {source} s WHERE {row_hash('s', cols, ty)} NOT IN "
-                     f"(SELECT {row_hash('t', cols, ty)} FROM {target} t WHERE {in_run})) a CROSS JOIN "
-                     f"(SELECT COUNT(*) AS n FROM {target} t WHERE {in_run} AND {row_hash('t', cols, ty)} NOT IN "
-                     f"(SELECT {row_hash('s', cols, ty)} FROM {source} s)) r")
     return " UNION ALL ".join(parts)
+
+
+def child_changes(result):
+    # Added / removed rows per child table, from the merge batch's per-statement row counts. merge_sql puts the
+    # upserts first, then a DELETE and an INSERT per child table. The Data API reports -1 when it has no count.
+    rows = [max(s.get("ResultRows", -1), 0) for s in result.get("SubStatements", [])][len(UPSERT_TABLES):]
+    rows += [0] * (2 * len(CHILDREN) - len(rows))
+    return {table: {"new": rows[2 * i + 1], "updated": 0, "removed": rows[2 * i]} for i, table in enumerate(CHILDREN)}
 
 
 def merge_sql(cc, columns, types):
@@ -390,14 +401,20 @@ def load(args, business_date):
     columns, types = redshift.columns(cc)
 
     # 1. stage: the trailing slash stops 2026-10-1 matching 2026-10-12's folder. A table whose file is missing
-    # fails its COPY, so a partial upload can't load silently.
-    counts = {}
-    for table in TABLES:
+    # fails its COPY, so a partial upload can't load silently. Tables are staged STAGE_WORKERS at a time; if one
+    # fails, the ones not yet started are cancelled and the error ends the run as before.
+    def stage(table):
         url = f"s3://{args.S3_BUCKET}/{args.S3_PREFIX}/processed/{table}/business_date={business_date:%Y-%m-%d}/"
         redshift.run(stage_sql(cc, table, columns[table], url, args.COPY_ROLE_ARN), f"coldstone-{cc}-stage-{table}")
-        counts[table] = int(redshift.query(f"SELECT COUNT(*) FROM {STAGING[cc]}.{q(table)}",
-                                           f"coldstone-{cc}-count-{table}")[0][0])
-        print(f"  staged {table:28} {counts[table]}")
+
+    pool = ThreadPoolExecutor(STAGE_WORKERS)
+    try:
+        list(pool.map(stage, TABLES))
+    finally:
+        pool.shutdown(cancel_futures=True)
+    counts = {table: to_int(n) for table, n in redshift.query(counts_sql(cc), f"coldstone-{cc}-counts")}
+    for table in TABLES:
+        print(f"  staged {table:28} {counts.get(table, 0)}")
 
     # Every extract contains the full branch list, so no branches means there were no files for this date (COPY
     # loads nothing without complaining when a folder is empty or missing). Stop rather than report a 0-row success.
@@ -407,7 +424,7 @@ def load(args, business_date):
                          f"coldstone-extract-{cc} for this date first; the load then starts automatically. "
                          f"{TARGET[cc]} was not changed.")
 
-    # 2. drop unchanged rows from staging, then count what the merge will add, update and remove
+    # 2. drop unchanged rows from staging, then count what the merge will add and update
     # One table at a time. Skipping unchanged rows is only an optimisation: if it can't be done for a table, that
     # table's rows are all rewritten, as before, rather than failing the load.
     for table in UPSERT_TABLES:
@@ -416,18 +433,18 @@ def load(args, business_date):
         except Exception as err:
             print(f"warning: could not skip unchanged {table} rows, so all of them will be rewritten "
                   f"({str(err)[:200]})")
-    changes = {table: {"new": to_int(n), "updated": to_int(u), "removed": to_int(r)}
-               for table, n, u, r in redshift.query(changes_sql(cc, columns, types), f"coldstone-{cc}-changes")}
+    changes = {table: {"new": to_int(n), "updated": to_int(u), "removed": 0}
+               for table, n, u in redshift.query(changes_sql(cc), f"coldstone-{cc}-changes")}
+
+    # 3. merge: a failure here rolls back the whole day, and analytics stays as it was
+    result = redshift.run(merge_sql(cc, columns, types), f"coldstone-{cc}-merge-{business_date:%Y%m%d}")
+    changes.update(child_changes(result))
     totals = {k: sum(c[k] for c in changes.values()) for k in ("new", "updated", "removed")}
-    print(f"\nChecked {sum(counts.values())} staged rows: {totals['new']} new, {totals['updated']} updated, "
-          f"{totals['removed']} removed; everything else unchanged")
+    print(f"\nMerged into {TARGET[cc]}. Checked {sum(counts.values())} staged rows: {totals['new']} new, "
+          f"{totals['updated']} updated, {totals['removed']} removed; everything else unchanged")
     for table, c in changes.items():
         if any(c.values()):
             print(f"  {table:28} new {c['new']}, updated {c['updated']}, removed {c['removed']}")
-
-    # 3. merge: a failure here rolls back the whole day, and analytics stays as it was
-    redshift.run(merge_sql(cc, columns, types), f"coldstone-{cc}-merge-{business_date:%Y%m%d}")
-    print(f"Merged into {TARGET[cc]}")
 
     # 4. report: the KPI queries only read, so a problem with them doesn't undo the load; it's noted instead
     try:
