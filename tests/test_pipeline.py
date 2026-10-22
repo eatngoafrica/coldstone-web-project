@@ -211,3 +211,11 @@ def test_load_stages_every_table_and_reports_changes(monkeypatch):
     assert result["rows_checked"] == 5 * len(loader.TABLES)
     assert result["changes"] == {"new": 2 * len(loader.UPSERT_TABLES) + len(loader.CHILDREN),
                                  "updated": len(loader.UPSERT_TABLES), "removed": len(loader.CHILDREN)}
+
+
+def test_load_card_shows_no_row_counts():
+    msg = {"source": "coldstone-pipeline", "stage": "load", "status": "success", "country": "ky",
+           "business_date": "2026-10-21", "rows_checked": 52632, "changes": {"new": 11816, "updated": 375, "removed": 0},
+           "kpis": {"orders": 0}}
+    text = json.dumps(notifier.load_card(msg))
+    assert "Rows" not in text and "11,816" not in text and "52,632" not in text

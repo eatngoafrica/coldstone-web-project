@@ -93,20 +93,9 @@ def money(minor, cc):
     return f"{symbol}{(minor or 0) / 100:,.2f}"
 
 
-def load_facts(msg):
-    # What the load changed. Older load scripts sent only a total of rows written, so that is shown as a fallback.
-    c = msg.get("changes")
-    if c is None:
-        return [{"title": "Rows loaded", "value": f"{msg.get('rows_merged', 0):,}"}]
-    total = c.get("new", 0) + c.get("updated", 0) + c.get("removed", 0)
-    return [{"title": "Rows received from Coldstone API into S3",
-             "value": f"{msg.get('rows_checked', 0):,} (yesterday's activity + the full menu, staff and branch lists)"},
-            {"title": "Rows changed in Redshift",
-             "value": f"{total:,} (new {c.get('new', 0):,} · updated {c.get('updated', 0):,} · removed {c.get('removed', 0):,})"},
-            {"title": "Everything else", "value": "already up to date, left as it was"}]
-
-
 def load_card(msg):
+    # Row counts (rows_checked, changes) stay in the message and the job log for troubleshooting, but aren't shown:
+    # they count every table, not sales, and confused readers next to the KPIs.
     ok = msg.get("status") == "success"
     cc = (msg.get("country") or "ng").lower()
     name, city, tz = COUNTRIES.get(cc, (cc.upper(), "UTC", timezone.utc))
@@ -136,7 +125,7 @@ def load_card(msg):
             {"type": "TextBlock", "wrap": True,
              "text": f"All data was successfully loaded into Redshift ({schema}) and is ready to be used."},
             {"type": "FactSet", "facts": [{"title": "Business date", "value": f"{day} ({city} time)"},
-                                          {"title": "Loaded at", "value": finished}] + load_facts(msg)}]
+                                          {"title": "Loaded at", "value": finished}]}]
     k = msg.get("kpis") or {}
     body.append({"type": "TextBlock", "weight": "Bolder", "wrap": True, "spacing": "Large",
                  "text": f"📊 Basic KPIs for {day}"})
