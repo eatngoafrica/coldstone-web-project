@@ -1,0 +1,80 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SamStack",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateChangeSet", "cloudformation:ExecuteChangeSet", "cloudformation:DescribeChangeSet",
+        "cloudformation:DeleteChangeSet", "cloudformation:DescribeStacks", "cloudformation:DescribeStackEvents",
+        "cloudformation:GetTemplateSummary", "cloudformation:GetTemplate", "cloudformation:ListStackResources"
+      ],
+      "Resource": [
+        "arn:aws:cloudformation:us-east-1:655103423742:stack/coldstone-pipeline/*",
+        "arn:aws:cloudformation:us-east-1:aws:transform/Serverless-2016-10-31"
+      ]
+    },
+    {
+      "Sid": "SamPackages",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::eatngo-coldstone-web-prod/deploy/coldstone-pipeline/*"
+    },
+    {
+      "Sid": "Lambdas",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction", "lambda:DeleteFunction", "lambda:GetFunction", "lambda:GetFunctionConfiguration",
+        "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration", "lambda:PutFunctionConcurrency",
+        "lambda:DeleteFunctionConcurrency", "lambda:PutFunctionEventInvokeConfig", "lambda:UpdateFunctionEventInvokeConfig",
+        "lambda:DeleteFunctionEventInvokeConfig", "lambda:GetFunctionEventInvokeConfig", "lambda:TagResource",
+        "lambda:UntagResource", "lambda:ListTags"
+      ],
+      "Resource": "arn:aws:lambda:us-east-1:655103423742:function:coldstone-*"
+    },
+    {
+      "Sid": "Layer",
+      "Effect": "Allow",
+      "Action": ["lambda:PublishLayerVersion", "lambda:DeleteLayerVersion", "lambda:GetLayerVersion"],
+      "Resource": [
+        "arn:aws:lambda:us-east-1:655103423742:layer:coldstone-extract-deps",
+        "arn:aws:lambda:us-east-1:655103423742:layer:coldstone-extract-deps:*"
+      ]
+    },
+    {
+      "Sid": "Roles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole", "iam:DeleteRole", "iam:GetRole", "iam:PassRole", "iam:TagRole", "iam:UntagRole",
+        "iam:UpdateAssumeRolePolicy", "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy", "iam:GetRolePolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::655103423742:role/coldstone-pipeline-*",
+        "arn:aws:iam::655103423742:role/coldstone-load-ng-lambda-role",
+        "arn:aws:iam::655103423742:role/coldstone-load-ky-lambda-role"
+      ]
+    },
+    {
+      "Sid": "DispatcherInvokePermission",
+      "Effect": "Allow",
+      "Action": ["iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:GetRolePolicy"],
+      "Resource": "arn:aws:iam::655103423742:role/coldstone-load-dispatcher-role-c0583g6z"
+    },
+    {
+      "Sid": "StateMachines",
+      "Effect": "Allow",
+      "Action": [
+        "states:CreateStateMachine", "states:UpdateStateMachine", "states:DeleteStateMachine",
+        "states:DescribeStateMachine", "states:TagResource", "states:UntagResource", "states:ListTagsForResource"
+      ],
+      "Resource": "arn:aws:states:us-east-1:655103423742:stateMachine:coldstone-extract-*"
+    },
+    {
+      "Sid": "Schedules",
+      "Effect": "Allow",
+      "Action": ["scheduler:CreateSchedule", "scheduler:UpdateSchedule", "scheduler:DeleteSchedule", "scheduler:GetSchedule"],
+      "Resource": "arn:aws:scheduler:us-east-1:655103423742:schedule/default/coldstone-*"
+    }
+  ]
+}

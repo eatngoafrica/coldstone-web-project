@@ -1,0 +1,4 @@
+# Packages the extract Lambdas need on top of the Lambda Python runtime (which provides boto3). Built into the
+# coldstone-extract-deps layer by deploy/build_lambdas.py. The load Lambdas need nothing extra.
+pyarrow==22.0.0
+requests==2.32.3

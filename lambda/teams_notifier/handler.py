@@ -7,8 +7,10 @@ Subscribed to the pipeline's SNS topic. Handles these kinds of message:
       {"source": "coldstone-pipeline", "country": "ng", "mode": "d-1", "status": "success",
        "business_date": "2026-10-13", "finished_at": "2026-10-14T04:28:00Z", "job_run_id": "jr_...",
        "row_counts": {"orders": 109, ...}, "problems": []}
-  * Glue events forwarded by an EventBridge rule: job FAILED / TIMEOUT / ERROR / STOPPED, and the
-    "running late" notice from the job's delay notification threshold
+  * extract failures the scripts couldn't report themselves (API errors, timeouts), published in the same
+    format by the state machines coldstone-extract-<cc>
+  * Lambda failure destination records from the load Lambdas: a load that timed out, crashed or never started.
+    Errors of type ReportedFailure are skipped: the load already published those itself
   * CloudWatch alarm notifications
 
 Environment variables:
@@ -46,7 +48,7 @@ def local_time(iso, tz=COUNTRIES["ng"][2]):
 
 
 def country_of(job_name):
-    # Job names end in -ng / -ky (coldstone-extract-ng, coldstone-load-ky ...)
+    # Function names end in -ng / -ky (coldstone-extract-ng, coldstone-load-ky ...)
     return next((cc for cc in COUNTRIES if (job_name or "").lower().endswith(f"-{cc}")), None)
 
 
@@ -82,8 +84,9 @@ def pipeline_card(msg):
                          "wrap": True, "isSubtle": True})
     if not ok:
         body.append({"type": "TextBlock", "wrap": True, "isSubtle": True,
-                     "text": f"Nothing was uploaded to processed. Fix the cause, then run coldstone-extract-{cc} "
-                             f"with --date {day}. Raw responses were saved for investigation."})
+                     "text": f"Nothing was uploaded to processed. Fix the cause, then start the Step Functions state "
+                             f"machine coldstone-extract-{cc} with {{\"date\": \"{day}\"}}. Raw responses were "
+                             f"saved for investigation."})
     return body
 
 
@@ -119,8 +122,8 @@ def load_card(msg):
                                              ([{"title": "Attempt", "value": attempts}] if attempts else [])},
                 {"type": "TextBlock", "wrap": True, "text": msg.get("error") or "No error message"},
                 {"type": "TextBlock", "wrap": True, "isSubtle": True,
-                 "text": f"{schema} was not changed (the load commits all or nothing). Fix the cause, then run "
-                         f"coldstone-load-{cc} with --date {day}."}]
+                 "text": f"{schema} was not changed (the load commits all or nothing). Fix the cause, then invoke "
+                         f"the Lambda coldstone-load-{cc} with {{\"date\": \"{day}\"}}."}]
     body = [title(f"✅ Coldstone {name} data for {day} is loaded into Redshift and ready to use", True),
             {"type": "TextBlock", "wrap": True,
              "text": f"All data was successfully loaded into Redshift ({schema}) and is ready to be used."},
@@ -163,27 +166,25 @@ def load_card(msg):
     return body
 
 
-def glue_card(event):
-    d = event.get("detail") or {}
-    job, state, run = d.get("jobName", "?"), d.get("state", "?"), d.get("jobRunId", "")
-    cc = country_of(job)
-    name, city, tz = COUNTRIES.get(cc, ("", "Lagos", COUNTRIES["ng"][2]))
-    late = event.get("detail-type") == "Glue Job Run Status"
-    text = (f"⏳ {job} is running late" if late else f"🚨 {job} {state.lower()}")
-    facts = [{"title": "Job", "value": job}, {"title": "State", "value": state},
-             {"title": "When", "value": f"{local_time(event.get('time'), tz)} ({city})"}]
-    if late:
-        minutes = (d.get("notificationCondition") or {}).get("NotifyDelayAfter")
-        facts.append({"title": "Running for", "value": f"over {minutes} minutes" if minutes else "longer than expected"})
-    if run:
-        facts.append({"title": "Run ID", "value": run})
-    body = [title(text, False), {"type": "FactSet", "facts": facts}]
-    if d.get("message"):
-        body.append({"type": "TextBlock", "wrap": True, "text": d["message"]})
-    body.append({"type": "TextBlock", "wrap": True, "isSubtle": True,
-                 "text": "Glue console → ETL jobs → the job → Runs → this run → Error logs." if not late else
-                         "Usually a slow or rate-limited API. If it hits the 60-minute timeout a failure card follows."})
-    return body
+def lambda_failure_card(msg):
+    # A Lambda failure destination record: the load Lambda failed in a way it couldn't report itself (timed out,
+    # crashed, or waited over 6 hours behind the country's previous load)
+    ctx, request = msg.get("requestContext") or {}, msg.get("requestPayload") or {}
+    error = msg.get("responsePayload") or {}
+    function = (ctx.get("functionArn") or "").split(":function:")[-1].split(":")[0] or "Coldstone Lambda"
+    cc = country_of(function)
+    _, city, tz = COUNTRIES.get(cc, ("", "Lagos", COUNTRIES["ng"][2]))
+    day = request.get("date") or "?"
+    why = {"EventAgeExceeded": "never started: it waited over 6 hours behind the previous load"}.get(
+        ctx.get("condition"), error.get("errorMessage") or ctx.get("condition") or "no error message")
+    return [title(f"🚨 {function} failed for {day}", False),
+            {"type": "FactSet", "facts": [{"title": "Function", "value": function},
+                                          {"title": "Business date", "value": day},
+                                          {"title": "When", "value": f"{local_time(msg.get('timestamp'), tz)} ({city})"}]},
+            {"type": "TextBlock", "wrap": True, "text": why},
+            {"type": "TextBlock", "wrap": True, "isSubtle": True,
+             "text": f"Logs: CloudWatch → Log groups → /aws/lambda/{function}. Reports are unchanged unless the merge "
+                     f"finished. To retry, invoke {function} with {{\"date\": \"{day}\"}} (safe to repeat)."}]
 
 
 def alarm_card(msg):
@@ -229,8 +230,11 @@ def lambda_handler(event, context):
                 print(f"Extract success for {msg.get('country')} {msg.get('business_date')}: card skipped")
                 continue
             post(pipeline_card(msg))
-        elif isinstance(msg, dict) and msg.get("source") == "aws.glue":
-            post(glue_card(msg))
+        elif isinstance(msg, dict) and "requestContext" in msg and "requestPayload" in msg:
+            if (msg.get("responsePayload") or {}).get("errorType") == "ReportedFailure":
+                print("Load failure already reported by the load itself: card skipped")
+                continue
+            post(lambda_failure_card(msg))
         elif isinstance(msg, dict) and "AlarmName" in msg:
             post(alarm_card(msg))
         else:

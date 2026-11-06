@@ -5,6 +5,8 @@
   * the NG and KY extracts write identical table layouts
   * the load job's table lists cover exactly the extract's tables, and its schema names exist in the DDL
   * the load dispatcher and Teams notifier Lambdas parse the messages the pipeline sends
+  * a pull split into parts (to fit Lambda's 15 minutes) rebuilds exactly the same day as a single pull
+  * the Lambda entry points pass settings through, and the state machine matches template.yaml
 """
 import importlib.util, json, os, re, sys
 from pathlib import Path
@@ -28,6 +30,7 @@ extract = {"ng": load("extract_prod_ng", "extract_prod_ng.py"), "ky": load("extr
 loader = load("load_redshift", "load_redshift.py")
 dispatcher = load("load_dispatcher", "lambda/load_dispatcher/handler.py")
 notifier = load("teams_notifier", "lambda/teams_notifier/handler.py")
+entry = load("entry", "lambda/pipeline/entry.py")
 
 SQL_TYPES = {"VARCHAR": pa.string(), "BOOLEAN": pa.bool_(), "DOUBLE PRECISION": pa.float64(),
              "TIMESTAMP": pa.timestamp("us"), "SMALLINT": pa.int16(), "INTEGER": pa.int32(), "BIGINT": pa.int64()}
@@ -119,7 +122,7 @@ def test_dispatcher_rejects_unknown_country():
         dispatcher.load_request(sqs_body(msg))
 
 
-def test_dispatcher_and_glue_job_names_agree():
+def test_dispatcher_and_load_function_names_agree():
     assert dispatcher.COUNTRIES == set(loader.SCHEMA_BASE) == set(notifier.COUNTRIES)
 
 
@@ -219,3 +222,285 @@ def test_load_card_shows_no_row_counts():
            "kpis": {"orders": 0}}
     text = json.dumps(notifier.load_card(msg))
     assert "Rows" not in text and "11,816" not in text and "52,632" not in text
+
+
+# ---------- Lambda: split pulls, entry points, dispatcher, notifier, state machine ----------
+
+def fake_api(module, monkeypatch, branches=5, hq_sees_all_staff=True):
+    """Stands in for the Coldstone API: a few records per endpoint, every branch with its own menu, staff and wallet.
+    As in the real API, the headquarters branch (b0) returns every branch's staff, unless hq_sees_all_staff=False."""
+    recent = "2026-11-04T10:00:00.000Z"
+    ids = [f"b{i}" for i in range(branches)]
+
+    def members(bid):
+        if bid == "b0" and hq_sees_all_staff:
+            return [{"_id": f"m_{b}", "branch": b} for b in ids]
+        return [{"_id": f"m_{bid}", "branch": bid}]
+
+    def data(path, params):
+        bid = params.get("branchId")
+        return {
+            "orders": {"orders": [{"_id": "o1", "createdAt": recent, "updatedAt": recent,
+                                   "branch": {"_id": "b0", "name": "B0"},
+                                   "products": [{"product": "p_b0", "price": 100, "quantity": 1}]}],
+                       "meta": {"hasNextPage": False}},
+            "customers": {"users": [{"_id": "u1", "createdAt": recent}], "meta": {"hasNextPage": False}},
+            "activity-logs": {"activities": [], "meta": {"hasNextPage": False}},
+            "discounts": {"discounts": []},
+            "roles": {"roles": [{"_id": "r1", "name": "admin"}]},
+            "branches": [{"_id": b, "name": f"Branch {b}", "isHeadquarters": b == "b0"} for b in ids],
+            "members": members(bid),
+            "menus": {"products": [{"_id": f"p_{bid}", "branch": bid, "price": 100}]},
+            "modifiers": {"products": []},
+            "categories": {"categories": [{"_id": f"c_{bid}", "name": "Cups"}]},
+            "wallet/balance": {"_id": f"w_{bid}", "branch": bid, "balance": 5},
+            "wallet/transactions": {"data": [{"_id": f"t_{bid}", "createdAt": recent, "amount": 5}],
+                                    "meta": {"hasNextPage": False}},
+        }[path]
+
+    class Response:
+        status_code, headers = 200, {}
+
+        def __init__(self, body):
+            self.body = body
+
+        def json(self):
+            return {"data": self.body}
+
+        def raise_for_status(self):
+            pass
+
+    calls = []
+
+    def get(url, headers=None, params=None, timeout=None):
+        path = url[len(module.BASE) + 1:]
+        calls.append(path)
+        return Response(data(path, params or {}))
+
+    monkeypatch.setattr(module.requests, "get", get)
+    monkeypatch.setattr(module, "headers", lambda: {})
+    monkeypatch.setattr(module, "DELAY", 0)
+    monkeypatch.setattr(module, "_until", None)
+    return calls
+
+
+@pytest.mark.parametrize("hq_sees_all_staff, member_calls", [(True, 1), (False, 1 + 5)])
+def test_staff_come_from_one_headquarters_call(hq_sees_all_staff, member_calls, monkeypatch):
+    # One members call when headquarters returns everyone; otherwise every branch is asked, as before
+    m = extract["ng"]
+    calls = fake_api(m, monkeypatch, hq_sees_all_staff=hq_sees_all_staff)
+    monkeypatch.setattr(m, "_raw", None)
+    t = m.Tables()
+    m.extract(t, m.datetime(2026, 11, 4, tzinfo=m.timezone.utc))
+    assert calls.count("members") == member_calls
+    assert sorted(t.rows["members"]) == [f"m_b{i}" for i in range(5)]
+    assert len(t.rows["branch_members"]) == 5
+
+
+@pytest.mark.parametrize("country", ["ng", "ky"])
+@pytest.mark.parametrize("parts", [1, 2, 3])
+@pytest.mark.parametrize("hq_sees_all_staff", [True, False])
+def test_split_pull_rebuilds_the_same_day(country, parts, hq_sees_all_staff, tmp_path, monkeypatch):
+    m = extract[country]
+    calls = fake_api(m, monkeypatch, hq_sees_all_staff=hq_sees_all_staff)
+    day = m.datetime(2026, 11, 4, tzinfo=m.timezone.utc)
+
+    monkeypatch.setattr(m, "_raw", None)
+    whole = m.Tables()
+    m.extract(whole, day)
+    single_pull_calls = len(calls)
+
+    # The same day pulled in parts, recorded the way the Lambda runs record them
+    calls.clear()
+    branches = None
+    for k in range(1, parts + 1):
+        recorder = m.RawRecorder(str(tmp_path), day, "run1", "d-1", "" if k == 1 else f".part{k}")
+        monkeypatch.setattr(m, "_raw", recorder)
+        branches = m.extract(m.Tables(), day, k, parts, branches)
+        recorder.close(True, part=k, parts=parts)
+    assert len(calls) == single_pull_calls, "the parts together should make exactly the single pull's API calls"
+
+    # --from-raw reads every part back as one pull, with no API calls
+    run_dir = tmp_path / "raw" / "business_date=2026-11-04"
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert m.raw_parts(str(run_dir), manifest) == parts
+    calls.clear()
+    monkeypatch.setattr(m, "_raw", m.RawReplay(str(run_dir), parts))
+    rebuilt = m.Tables()
+    m.extract(rebuilt, day)
+    assert calls == []
+    assert rebuilt.rows == whole.rows
+    assert len(whole.rows["menu_items"]) == 5 and len(whole.rows["wallets"]) == 5
+
+
+def test_state_machine_sequence_through_main(tmp_path, monkeypatch):
+    # The three Lambda runs the NG state machine makes (part 1, part 2, build from raw), through main(), with a
+    # local folder standing in for S3
+    import shutil
+    m = extract["ng"]
+    fake_api(m, monkeypatch)
+    s3 = tmp_path / "s3"
+    published = []
+
+    def upload(files, bucket, prefix, layer):
+        for rel, local in files.items():
+            (s3 / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(local, s3 / rel)
+
+    monkeypatch.setattr(m, "upload", upload)
+    monkeypatch.setattr(m, "first_part_manifest",
+                        lambda day, b, p: json.loads((s3 / f"raw/business_date={day:%Y-%m-%d}/manifest.json").read_text()))
+    monkeypatch.setattr(m, "latest_raw_run", lambda day, root, b, p: str(s3 / f"raw/business_date={day:%Y-%m-%d}"))
+    monkeypatch.setattr(m, "publish", lambda args, day, mode, status, t, problems: published.append((status, problems)))
+    for event in [{"part": 1, "parts": 2}, {"part": 2, "parts": 2}, {"from_raw": True}]:
+        monkeypatch.setattr(m, "WORK_DIR", str(tmp_path / "work"))  # a fresh /tmp each run, as on Lambda
+        shutil.rmtree(tmp_path / "work", ignore_errors=True)
+        monkeypatch.setattr(sys, "argv", ["x"] + entry.build_argv([], entry.EXTRACT_OPTIONS,
+                                                                  dict(event, date="2026-11-04"), None) +
+                            ["--S3_BUCKET", "bucket"])
+        m.main()
+    assert published == [("success", [])], "only the build step publishes, once"
+    assert sorted(p.name for p in (s3 / "raw/business_date=2026-11-04").glob("manifest*")) == \
+        ["manifest.json", "manifest.part2.json"]
+    assert (s3 / "processed/menu_items/business_date=2026-11-04/menu_items.parquet").exists()
+    assert len(json.loads((s3 / "raw/business_date=2026-11-04/manifest.json").read_text())["branches"]) == 5
+
+
+@pytest.mark.parametrize("country", ["ng", "ky"])
+def test_requests_are_paced_from_start_to_start(country, monkeypatch):
+    # The API's response time counts towards the gap: a 0.5 s answer leaves only the rest of DELAY to wait
+    m = extract[country]
+    clock, sleeps = [100.0], []
+    monkeypatch.setattr(m.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(m.time, "sleep", lambda s: (sleeps.append(round(s, 3)), clock.__setitem__(0, clock[0] + s)))
+    monkeypatch.setattr(m, "_last_request", 0.0)
+    m.pace()                       # first request: no wait
+    clock[0] += 0.5                # the API takes 0.5 s to answer
+    m.pace()                       # waits only the remaining 0.55 s
+    clock[0] += 2.0                # a slow answer, longer than DELAY
+    m.pace()                       # no wait
+    assert sleeps == [round(m.DELAY - 0.5, 3)]
+    assert 60 / m.DELAY < 60, "must stay under the API's 60 requests a minute"
+
+
+def test_split_pull_rejects_a_part_from_another_run(tmp_path):
+    m = extract["ng"]
+    (tmp_path / "manifest.part2.json").write_text(json.dumps({"complete": True, "run_id": "older"}), encoding="utf-8")
+    with pytest.raises(SystemExit, match="earlier run"):
+        m.raw_parts(str(tmp_path), {"business_date": "2026-11-04", "run_id": "run1", "parts": 2})
+    with pytest.raises(SystemExit, match="part 3 of 3"):
+        m.raw_parts(str(tmp_path), {"business_date": "2026-11-04", "run_id": "older", "parts": 3})
+
+
+class FakeContext:
+    aws_request_id = "req-1"
+
+
+def test_entry_passes_environment_and_event_to_the_extract(monkeypatch):
+    for name in entry.EXTRACT_SETTINGS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("S3_BUCKET", "bucket")
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:1:topic")
+    event = {"date": "2026-11-04", "part": 2, "parts": 2, "from_raw": False, "full_history": None}
+    argv = entry.build_argv(entry.EXTRACT_SETTINGS, entry.EXTRACT_OPTIONS, event, FakeContext())
+    args = extract["ng"].load_settings(argv)
+    assert (args.S3_BUCKET, args.date, args.part, args.parts, args.from_raw, args.JOB_RUN_ID) == \
+        ("bucket", "2026-11-04", 2, 2, False, "req-1")
+    assert args.S3_PREFIX == "coldstone_web_ng" and args.SNS_TOPIC_ARN.endswith(":topic")
+    args = extract["ky"].load_settings(entry.build_argv(entry.EXTRACT_SETTINGS, entry.EXTRACT_OPTIONS,
+                                                        {"from_raw": True}, None))
+    assert args.from_raw and args.part is None
+
+
+def test_entry_passes_environment_and_event_to_the_load(monkeypatch):
+    for name in entry.LOAD_SETTINGS:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in {"COUNTRY": "ky", "S3_BUCKET": "bucket", "REDSHIFT_WORKGROUP": "wg"}.items():
+        monkeypatch.setenv(name, value)
+    args = loader.load_settings(entry.build_argv(entry.LOAD_SETTINGS, entry.LOAD_OPTIONS,
+                                                 {"date": "2026-11-04", "attempt": 2}, FakeContext()))
+    assert (args.COUNTRY, args.S3_PREFIX, args.date, args.ATTEMPT) == ("ky", "coldstone_web_ky", "2026-11-04", 2)
+
+
+def raiser(error):
+    def main():
+        raise error
+    return main
+
+
+@pytest.mark.parametrize("raised, expected", [(SystemExit(1), "ReportedFailure"),
+                                              (SystemExit("branches: got exactly 100"), "RuntimeError"),
+                                              (ValueError("API down"), "ValueError")])
+def test_entry_extract_errors(monkeypatch, tmp_path, raised, expected):
+    # Only the data-check failure (exit 1) was published by the script; the state machine reports the rest
+    monkeypatch.setenv("COUNTRY", "ng")
+    monkeypatch.setattr(extract["ng"], "WORK_DIR", str(tmp_path / "work"))
+    monkeypatch.setattr(extract["ng"], "main", raiser(raised))
+    with pytest.raises(Exception) as err:
+        entry.extract_handler({}, FakeContext())
+    assert type(err.value).__name__ == expected
+
+
+@pytest.mark.parametrize("raised, expected", [(RuntimeError("merge failed"), "ReportedFailure"),
+                                              (SystemExit("No extract found"), "ReportedFailure"),
+                                              (SystemExit(2), "RuntimeError")])
+def test_entry_load_errors(monkeypatch, raised, expected):
+    monkeypatch.setattr(loader, "main", raiser(raised))
+    with pytest.raises(Exception) as err:
+        entry.load_handler({}, FakeContext())
+    assert type(err.value).__name__ == expected
+
+
+def test_dispatcher_invokes_the_country_load_lambda(monkeypatch):
+    invoked = []
+
+    class FakeLambda:
+        def invoke(self, **kw):
+            if kw["FunctionName"].endswith("-ky"):
+                raise RuntimeError("throttled")
+            invoked.append(kw)
+
+    monkeypatch.setattr(dispatcher, "lambda_client", FakeLambda())
+    ok = {"source": "coldstone-pipeline", "stage": "extract", "status": "success", "country": "ng",
+          "business_date": "2026-11-04"}
+    bad = dict(ok, country="ky")
+    result = dispatcher.lambda_handler({"Records": [{"messageId": "1", "body": json.dumps(ok)},
+                                                    {"messageId": "2", "body": json.dumps(bad)}]}, None)
+    assert invoked[0]["FunctionName"] == "coldstone-load-ng" and invoked[0]["InvocationType"] == "Event"
+    assert json.loads(invoked[0]["Payload"]) == {"date": "2026-11-04", "attempt": 1}
+    assert result == {"batchItemFailures": [{"itemIdentifier": "2"}]}
+
+
+@pytest.mark.parametrize("error_type, cards", [("ReportedFailure", 0), (None, 1)])
+def test_notifier_lambda_failure_destination(monkeypatch, error_type, cards):
+    posted = []
+    monkeypatch.setattr(notifier, "post", posted.append)
+    payload = {"errorMessage": "Task timed out after 900.00 seconds"}
+    if error_type:
+        payload["errorType"] = error_type
+    msg = {"version": "1.0", "timestamp": "2026-11-05T04:30:00.000Z",
+           "requestContext": {"functionArn": "arn:aws:lambda:us-east-1:1:function:coldstone-load-ng:$LATEST",
+                              "condition": "RetriesExhausted"},
+           "requestPayload": {"date": "2026-11-04", "attempt": 1}, "responsePayload": payload}
+    notifier.lambda_handler({"Records": [{"Sns": {"Message": json.dumps(msg), "Subject": None}}]}, None)
+    assert len(posted) == cards
+    if cards:
+        text = json.dumps(posted[0])
+        assert "coldstone-load-ng" in text and "2026-11-04" in text and "timed out" in text
+
+
+def test_state_machine_matches_template():
+    definition = (ROOT / "statemachine/extract.asl.json").read_text(encoding="utf-8")
+    states = json.loads(definition)["States"]
+    placeholders = set(re.findall(r"\$\{(\w+)\}", definition))
+    template = (ROOT / "template.yaml").read_text(encoding="utf-8")
+    blocks = re.findall(r"DefinitionSubstitutions:\n((?:        \w+: .*\n)+)", template)
+    assert len(blocks) == 2, "expected the NG and KY state machines"
+    for block in blocks:
+        assert set(re.findall(r"^        (\w+):", block, re.M)) == placeholders
+    targets = {c["Next"] for s in states.values() for c in s.get("Catch", [])} | \
+              {s["Next"] for s in states.values() if "Next" in s}
+    assert targets <= set(states)
+    # the extract Lambdas raise ReportedFailure when they already published the failure
+    assert all(s["Catch"][0]["ErrorEquals"] == [entry.ReportedFailure.__name__]
+               for s in states.values() if "Catch" in s)

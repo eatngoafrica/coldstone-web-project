@@ -1,9 +1,10 @@
-"""Load one country's business date from S3 processed Parquet into Redshift (AWS Glue Python shell).
+"""Load one country's business date from S3 processed Parquet into Redshift (AWS Lambda: coldstone-load-ng / coldstone-load-ky).
 
 Runs after the country's extract job has checked the files and uploaded them to
 s3://S3_BUCKET/S3_PREFIX/processed/<table>/business_date=D/.
 
-Glue job parameters:
+Settings, as --NAME value arguments (on Lambda, lambda/pipeline/entry.py builds them from the function's
+environment and the event: {"date": "YYYY-MM-DD", "attempt": 2}; run by hand, type them):
     --COUNTRY             required: ng or ky. Selects the schemas and the D-1 timezone
     --S3_BUCKET           required: bucket name (no s3://)
     --REDSHIFT_WORKGROUP  required: Redshift Serverless workgroup name
@@ -18,8 +19,8 @@ Glue job parameters:
                           load to run again in 10 minutes, up to 3 runs (role needs sqs:SendMessage on it)
     --ATTEMPT             set by the load dispatcher Lambda on re-queued runs (default 1)
 
-Normally the dispatcher (lambda/load_dispatcher) starts this job when an extract succeeds; it can also be run by
-hand with --date.
+Normally the dispatcher (lambda/load_dispatcher) invokes the country's load Lambda when an extract succeeds; to
+load a date by hand, invoke coldstone-load-<cc> with {"date": "YYYY-MM-DD"}. Each load Lambda runs one load at a time.
 
 Steps:
   1. stage    for each table (a few at a time): recreate <base>_staging.<table> with <base>_analytics' columns minus
@@ -38,7 +39,7 @@ Steps:
               "loaded and ready" message. A failed load publishes the error instead (analytics is unchanged).
 Loading the same date twice gives the same result, so reruns are safe.
 
-SQL runs through the Redshift Data API as the job's IAM role (database user "IAMR:<role name>"), so there is
+SQL runs through the Redshift Data API as the Lambda's IAM role (database user "IAMR:<role name>"), so there is
 no database password. Column lists are read from Redshift itself, so this script has no other project imports.
 """
 import sys, json, time, argparse
@@ -274,14 +275,14 @@ class Redshift:
         missing = [t for t in TABLES if t not in cols]
         if missing:
             raise SystemExit(f"{TARGET[cc]} is missing {missing}: run sql/redshift/01_tables_{cc}.sql in the coldstone_web database, and check "
-                             f"02_grants_{cc}.sql was run so this job's user can see the tables")
+                             f"03_grants_lambda_{cc}.sql was run so the load's user can see the tables")
         return cols, types
 
 
 # ---------- main ----------
 
 def load_settings(argv):
-    # Glue passes job parameters as --NAME value, plus arguments of its own that are ignored here
+    # Settings arrive as --NAME value; unknown arguments are ignored
     parser = argparse.ArgumentParser()
     parser.add_argument("--COUNTRY", required=True, type=str.lower, choices=sorted(TIMEZONES))
     parser.add_argument("--S3_BUCKET", required=True)
@@ -292,7 +293,7 @@ def load_settings(argv):
     parser.add_argument("--COPY_ROLE_ARN", default="default")
     parser.add_argument("--date", help="business date YYYY-MM-DD in the country's local time (default: yesterday)")
     parser.add_argument("--SNS_TOPIC_ARN")
-    parser.add_argument("--JOB_RUN_ID")  # passed by Glue; included in the alert
+    parser.add_argument("--JOB_RUN_ID")  # the Lambda request id; included in the alert
     parser.add_argument("--LOAD_QUEUE_URL", help="SQS load queue; a load that hits temporary errors is re-queued here")
     parser.add_argument("--ATTEMPT", type=int, default=1, help="set by the load dispatcher for re-queued loads")
     args, _ = parser.parse_known_args(argv)
@@ -385,7 +386,7 @@ def main():
         load(args, business_date)
     except (Exception, SystemExit) as err:  # SystemExit too: the script's own checks stop the run that way
         # analytics is untouched: the merge is one transaction and only commits if every statement succeeds.
-        # A temporary error goes back on the queue (the job then ends normally); anything else fails the run.
+        # A temporary error goes back on the queue (the run then ends normally); anything else fails the run.
         if is_transient(err) and requeue(args, business_date, err):
             return
         publish(args, business_date, "failed", error=str(err)[:1000], attempt=args.ATTEMPT, max_attempts=MAX_ATTEMPTS)

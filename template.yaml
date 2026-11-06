@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Coldstone web pipeline on Lambda (replaces the Glue jobs). Creates the extract and load Lambdas, the extract
+  state machines and their daily schedules. Uses the EXISTING S3 bucket and paths, Redshift workgroup, SNS topic,
+  SQS load queue, dispatcher and Teams notifier, which this stack never creates or deletes.
+  Build first (python deploy/build_lambdas.py), then sam deploy; settings are in samconfig.toml.
+
+Parameters:
+  S3Bucket:
+    Type: String
+    Description: Existing landing bucket (the Glue jobs' --S3_BUCKET), no s3://
+  NgS3Prefix:
+    Type: String
+    Default: coldstone_web_ng
+  KyS3Prefix:
+    Type: String
+    Default: coldstone_web_ky
+  NgKeyParam:
+    Type: String
+    Default: COLDSTONE_KEY-NG
+    Description: SSM parameter holding the NG API key
+  KyKeyParam:
+    Type: String
+    Default: COLDSTONE_KEY-KY
+    Description: SSM parameter holding the KY API key
+  RedshiftWorkgroup:
+    Type: String
+    Description: Existing Redshift Serverless workgroup name (the load jobs' --REDSHIFT_WORKGROUP)
+  RedshiftDatabase:
+    Type: String
+    Default: coldstone_web
+  CopyRoleArn:
+    Type: String
+    Default: default
+    Description: IAM role Redshift uses to read S3 (the load jobs' --COPY_ROLE_ARN), or "default"
+  PipelineTopicArn:
+    Type: String
+    Description: Existing SNS topic the pipeline publishes results to (the jobs' --SNS_TOPIC_ARN)
+  LoadQueueName:
+    Type: String
+    Default: coldstone-load-queue
+  DispatcherRoleName:
+    Type: String
+    Description: Name of the existing coldstone-load-dispatcher Lambda's IAM role (Configuration > Permissions); it is given permission to invoke the load Lambdas
+  NgParts:
+    Type: Number
+    Default: 2
+    Description: How many Lambda runs the NG pull is split into (Glue took 13 min for the whole pull)
+  KyParts:
+    Type: Number
+    Default: 1
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Architectures: [x86_64]
+    Timeout: 900
+
+Resources:
+  # ---------- extract ----------
+
+  ExtractDeps:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: coldstone-extract-deps
+      Description: pyarrow and requests for the Coldstone extracts (lambda/pipeline/requirements.txt)
+      ContentUri: build/layer
+      CompatibleRuntimes: [python3.14]
+      CompatibleArchitectures: [x86_64]
+      RetentionPolicy: Delete
+
+  ExtractNg:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: coldstone-extract-ng
+      Description: Coldstone NG extract (extract_prod_ng.py); run by the state machine coldstone-extract-ng
+      CodeUri: build/extract_ng
+      Handler: entry.extract_handler
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Layers: [!Ref ExtractDeps]
+      Environment:
+        Variables:
+          COUNTRY: ng
+          S3_BUCKET: !Ref S3Bucket
+          S3_PREFIX: !Ref NgS3Prefix
+          COLDSTONE_KEY_PARAM: !Ref NgKeyParam
+          SNS_TOPIC_ARN: !Ref PipelineTopicArn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${S3Bucket}/${NgS3Prefix}/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${S3Bucket}/${NgS3Prefix}/raw/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${S3Bucket}
+              Condition:
+                StringLike:
+                  s3:prefix: !Sub ${NgS3Prefix}/raw/*
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NgKeyParam}
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref PipelineTopicArn
+
+  ExtractKy:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: coldstone-extract-ky
+      Description: Coldstone KY extract (extract_prod_ky.py); run by the state machine coldstone-extract-ky
+      CodeUri: build/extract_ky
+      Handler: entry.extract_handler
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Layers: [!Ref ExtractDeps]
+      Environment:
+        Variables:
+          COUNTRY: ky
+          S3_BUCKET: !Ref S3Bucket
+          S3_PREFIX: !Ref KyS3Prefix
+          COLDSTONE_KEY_PARAM: !Ref KyKeyParam
+          SNS_TOPIC_ARN: !Ref PipelineTopicArn
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub arn:aws:s3:::${S3Bucket}/${KyS3Prefix}/*
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${S3Bucket}/${KyS3Prefix}/raw/*
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${S3Bucket}
+              Condition:
+                StringLike:
+                  s3:prefix: !Sub ${KyS3Prefix}/raw/*
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${KyKeyParam}
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref PipelineTopicArn
+
+  ExtractNgStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: coldstone-extract-ng
+      DefinitionUri: statemachine/extract.asl.json
+      DefinitionSubstitutions:
+        Country: ng
+        CountryUpper: NG
+        UtcOffset: "+0100"
+        Parts: !Ref NgParts
+        ExtractFunctionArn: !GetAtt ExtractNg.Arn
+        TopicArn: !Ref PipelineTopicArn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExtractNg
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref PipelineTopicArn
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            Name: coldstone-extract-ng-lambda-daily
+            Description: Daily D-1 Nigeria extract at 05:00 Lagos; the load follows automatically
+            ScheduleExpression: cron(0 5 * * ? *)
+            ScheduleExpressionTimezone: Africa/Lagos
+            State: !Ref ScheduleState
+            Input: "{}"
+
+  ExtractKyStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: coldstone-extract-ky
+      DefinitionUri: statemachine/extract.asl.json
+      DefinitionSubstitutions:
+        Country: ky
+        CountryUpper: KY
+        UtcOffset: "+0300"
+        Parts: !Ref KyParts
+        ExtractFunctionArn: !GetAtt ExtractKy.Arn
+        TopicArn: !Ref PipelineTopicArn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ExtractKy
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref PipelineTopicArn
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            Name: coldstone-extract-ky-lambda-daily
+            Description: Daily D-1 Kenya extract at 05:30 Nairobi; the load follows automatically
+            ScheduleExpression: cron(30 5 * * ? *)
+            ScheduleExpressionTimezone: Africa/Nairobi
+            State: !Ref ScheduleState
+            Input: "{}"
+
+  # ---------- load ----------
+  # Redshift maps each role to the database user "IAMR:<role name>", so the roles have fixed names that
+  # sql/redshift/03_grants_lambda_<cc>.sql grants to.
+
+  LoadNgRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: coldstone-load-ng-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: coldstone-load
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [redshift-data:ExecuteStatement, redshift-data:BatchExecuteStatement]
+                Resource: !Sub arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*
+              - Effect: Allow
+                Action: [redshift-data:DescribeStatement, redshift-data:GetStatementResult, redshift-data:CancelStatement]
+                Resource: "*"
+              - Effect: Allow
+                Action: redshift-serverless:GetCredentials
+                Resource: !Sub arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref PipelineTopicArn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${LoadQueueName}
+
+  LoadKyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: coldstone-load-ky-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: coldstone-load
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [redshift-data:ExecuteStatement, redshift-data:BatchExecuteStatement]
+                Resource: !Sub arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*
+              - Effect: Allow
+                Action: [redshift-data:DescribeStatement, redshift-data:GetStatementResult, redshift-data:CancelStatement]
+                Resource: "*"
+              - Effect: Allow
+                Action: redshift-serverless:GetCredentials
+                Resource: !Sub arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref PipelineTopicArn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${LoadQueueName}
+
+  LoadNg:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: coldstone-load-ng
+      Description: Coldstone NG Redshift load (load_redshift.py); invoked by coldstone-load-dispatcher
+      CodeUri: build/load
+      Handler: entry.load_handler
+      MemorySize: 512
+      Role: !GetAtt LoadNgRole.Arn
+      ReservedConcurrentExecutions: 1  # one NG load at a time: loads share the staging tables
+      Environment:
+        Variables:
+          COUNTRY: ng
+          S3_BUCKET: !Ref S3Bucket
+          S3_PREFIX: !Ref NgS3Prefix
+          REDSHIFT_WORKGROUP: !Ref RedshiftWorkgroup
+          REDSHIFT_DATABASE: !Ref RedshiftDatabase
+          COPY_ROLE_ARN: !Ref CopyRoleArn
+          SNS_TOPIC_ARN: !Ref PipelineTopicArn
+          LOAD_QUEUE_URL: !Sub https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${LoadQueueName}
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0          # the load re-queues itself on temporary Redshift errors
+        MaximumEventAgeInSeconds: 21600  # a load may wait up to 6 hours behind the previous one
+        DestinationConfig:
+          OnFailure:
+            Type: SNS
+            Destination: !Ref PipelineTopicArn
+
+  LoadKy:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: coldstone-load-ky
+      Description: Coldstone KY Redshift load (load_redshift.py); invoked by coldstone-load-dispatcher
+      CodeUri: build/load
+      Handler: entry.load_handler
+      MemorySize: 512
+      Role: !GetAtt LoadKyRole.Arn
+      ReservedConcurrentExecutions: 1  # one KY load at a time: loads share the staging tables
+      Environment:
+        Variables:
+          COUNTRY: ky
+          S3_BUCKET: !Ref S3Bucket
+          S3_PREFIX: !Ref KyS3Prefix
+          REDSHIFT_WORKGROUP: !Ref RedshiftWorkgroup
+          REDSHIFT_DATABASE: !Ref RedshiftDatabase
+          COPY_ROLE_ARN: !Ref CopyRoleArn
+          SNS_TOPIC_ARN: !Ref PipelineTopicArn
+          LOAD_QUEUE_URL: !Sub https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${LoadQueueName}
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+        MaximumEventAgeInSeconds: 21600
+        DestinationConfig:
+          OnFailure:
+            Type: SNS
+            Destination: !Ref PipelineTopicArn
+
+  # The existing dispatcher keeps its own role; this adds permission to invoke the two load Lambdas
+  DispatcherInvokeLoads:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref DispatcherRoleName
+      PolicyName: coldstone-invoke-load-lambdas
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: [!GetAtt LoadNg.Arn, !GetAtt LoadKy.Arn]
+
+Outputs:
+  ExtractNgStateMachine:
+    Value: !Ref ExtractNgStateMachine
+  ExtractKyStateMachine:
+    Value: !Ref ExtractKyStateMachine
+  LoadUsers:
+    Description: Redshift database users the load Lambdas connect as (granted by sql/redshift/03_grants_lambda_<cc>.sql)
+    Value: '"IAMR:coldstone-load-ng-lambda-role", "IAMR:coldstone-load-ky-lambda-role"'
