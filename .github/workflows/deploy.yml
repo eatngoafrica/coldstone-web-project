@@ -68,6 +68,21 @@ jobs:
       - name: Build the Lambda code and layer
         run: python deploy/build_lambdas.py
 
+      # A stack whose very first create failed is left in ROLLBACK_COMPLETE: empty, and CloudFormation refuses to
+      # update it. Delete it so this deploy can create it again. Any other state (e.g. a working stack whose update
+      # rolled back, UPDATE_ROLLBACK_COMPLETE) is left alone.
+      - name: Clear a failed first deploy
+        run: |
+          set -euo pipefail
+          status=$(aws cloudformation describe-stacks --stack-name coldstone-pipeline \
+            --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE)
+          echo "coldstone-pipeline: $status"
+          if [[ "$status" == "ROLLBACK_COMPLETE" ]]; then
+            echo "Deleting the empty stack left by the failed first deploy"
+            aws cloudformation delete-stack --stack-name coldstone-pipeline
+            aws cloudformation wait stack-delete-complete --stack-name coldstone-pipeline
+          fi
+
       - name: Deploy the pipeline stack (SAM)
         run: sam deploy --no-progressbar
 
