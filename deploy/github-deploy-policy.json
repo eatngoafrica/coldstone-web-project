@@ -59,7 +59,10 @@
       "Sid": "DispatcherInvokePermission",
       "Effect": "Allow",
       "Action": ["iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:GetRolePolicy"],
-      "Resource": "arn:aws:iam::655103423742:role/coldstone-load-dispatcher-role-c0583g6z"
+      "Resource": [
+        "arn:aws:iam::655103423742:role/service-role/coldstone-load-dispatcher-role-c0583g6z",
+        "arn:aws:iam::655103423742:role/coldstone-load-dispatcher-role-c0583g6z"
+      ]
     },
     {
       "Sid": "StateMachines",
