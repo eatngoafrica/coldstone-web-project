@@ -17,7 +17,7 @@ parameter_overrides = [
   "RedshiftWorkgroup=eatngo-analytics",             # --REDSHIFT_WORKGROUP (load jobs)
   "PipelineTopicArn=arn:aws:sns:us-east-1:655103423742:coldstone-pipeline-alerts",              # --SNS_TOPIC_ARN, arn:aws:sns:us-east-1:655103423742:...
   "DispatcherRoleName=coldstone-load-dispatcher-role-c0583g6z",            # Lambda > coldstone-load-dispatcher > Configuration > Permissions > Role name
-  "NotifierRoleName=CHANGE_ME",               # Lambda > coldstone-teams-notifier > Configuration > Permissions > Role name
+  "NotifierRoleName=coldstone-teams-notifier-role-6irwab0m",             # Lambda > coldstone-teams-notifier > Configuration > Permissions > Role name
   "CopyRoleArn=arn:aws:iam::655103423742:role/coldstone-redshift-s3-read-role",                     # --COPY_ROLE_ARN (load jobs) if they set one
   # Only if the Glue jobs used something other than these defaults:
   "NgS3Prefix=coldstone_web_ng",
