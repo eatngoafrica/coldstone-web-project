@@ -1,8 +1,11 @@
 name: Deploy
 
 # Runs after CI passes on main, or by hand from the Actions tab (Run workflow).
-# Glue jobs read their script from S3 on every run, so uploading the script is the deploy; the jobs' saved
-# parameters (--COPY_ROLE_ARN, --additional-python-modules ...) are left as they are.
+#   1. sam deploy: the extract and load Lambdas, the extract state machines and their schedules (template.yaml,
+#      settings in samconfig.toml). It uses the existing bucket, Redshift, SNS topic and queue and never deletes them.
+#   2. the existing dispatcher and Teams notifier Lambdas get their new code; their settings are left as they are.
+# Step 1 goes first so the load Lambdas exist before the new dispatcher starts invoking them.
+
 on:
   workflow_run:
     workflows: [CI]
@@ -32,6 +35,14 @@ jobs:
           # deploy exactly the commit CI tested
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.DEPLOY_ROLE }}
@@ -41,11 +52,10 @@ jobs:
       - name: Pre-flight checks
         run: |
           set -euo pipefail
-          for job in coldstone-extract-ng coldstone-extract-ky coldstone-load-ng coldstone-load-ky; do
-            path=$(aws glue get-job --job-name "$job" --query 'Job.Command.ScriptLocation' --output text)
-            [[ "$path" == s3://* ]] || { echo "::error::$job has no S3 script path ($path)"; exit 1; }
-            echo "$job -> $path"
-          done
+          if grep -n CHANGE_ME samconfig.toml; then
+            echo "::error::samconfig.toml still has CHANGE_ME values; fill them in from the Glue jobs' parameters"
+            exit 1
+          fi
           for fn in coldstone-teams-notifier coldstone-load-dispatcher; do
             handler=$(aws lambda get-function-configuration --function-name "$fn" --query Handler --output text)
             if [[ "$handler" != "handler.lambda_handler" ]]; then
@@ -55,20 +65,13 @@ jobs:
             echo "$fn handler OK"
           done
 
-      - name: Upload Glue scripts
-        run: |
-          set -euo pipefail
-          deploy() {  # deploy <glue job> <script in this repo>
-            path=$(aws glue get-job --job-name "$1" --query 'Job.Command.ScriptLocation' --output text)
-            aws s3 cp "$2" "$path"
-            echo "$1: $2 -> $path"
-          }
-          deploy coldstone-extract-ng extract_prod_ng.py
-          deploy coldstone-extract-ky extract_prod_ky.py
-          deploy coldstone-load-ng    load_redshift.py
-          deploy coldstone-load-ky    load_redshift.py
+      - name: Build the Lambda code and layer
+        run: python deploy/build_lambdas.py
 
-      - name: Deploy Lambdas
+      - name: Deploy the pipeline stack (SAM)
+        run: sam deploy --no-progressbar
+
+      - name: Deploy the dispatcher and Teams notifier
         run: |
           set -euo pipefail
           deploy() {  # deploy <lambda function> <folder under lambda/>

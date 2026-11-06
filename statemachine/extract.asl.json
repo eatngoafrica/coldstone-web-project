@@ -1,0 +1,111 @@
+{
+  "Comment": "Coldstone ${Country} daily extract: pull the API into raw in ${Parts} part(s), each one Lambda run under 15 minutes, then build the processed Parquet from raw (that step publishes the result, which starts the Redshift load). Input (all optional): {\"date\": \"YYYY-MM-DD\", \"full_history\": true}. Without a date the business date is yesterday at UTC${UtcOffset}.",
+  "QueryLanguage": "JSONata",
+  "StartAt": "BusinessDate",
+  "States": {
+    "BusinessDate": {
+      "Type": "Pass",
+      "Comment": "Fix the business date once, so every part pulls the same day",
+      "Assign": {
+        "input": "{% $type($states.input) = 'object' ? $states.input : {} %}",
+        "date": "{% $type($states.input) = 'object' and $exists($states.input.date) and $states.input.date != '' ? $states.input.date : $fromMillis($millis() - 86400000, '[Y0001]-[M01]-[D01]', '${UtcOffset}') %}",
+        "parts": "{% ${Parts} %}"
+      },
+      "Next": "PullFirstPart"
+    },
+    "PullFirstPart": {
+      "Type": "Task",
+      "Comment": "Orders, customers, activity logs, discounts, roles, the branch list and the first share of the branches",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${ExtractFunctionArn}",
+        "Payload": "{% $merge([$input, {'date': $date, 'part': 1, 'parts': $parts, 'from_raw': false}]) %}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {"ErrorEquals": ["ReportedFailure"], "Next": "Failed"},
+        {"ErrorEquals": ["States.ALL"], "Assign": {"error": "{% $states.errorOutput %}", "step": "pull part 1"}, "Next": "NotifyFailure"}
+      ],
+      "Next": "PullOtherParts"
+    },
+    "PullOtherParts": {
+      "Type": "Map",
+      "Comment": "The other shares of the branches, one at a time (they share the API's rate limit)",
+      "Items": "{% $parts > 1 ? [2..$parts] : [] %}",
+      "MaxConcurrency": 1,
+      "ItemProcessor": {
+        "ProcessorConfig": {"Mode": "INLINE"},
+        "StartAt": "PullPart",
+        "States": {
+          "PullPart": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Arguments": {
+              "FunctionName": "${ExtractFunctionArn}",
+              "Payload": "{% $merge([$input, {'date': $date, 'part': $states.input, 'parts': $parts, 'from_raw': false}]) %}"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "Catch": [
+        {"ErrorEquals": ["ReportedFailure"], "Next": "Failed"},
+        {"ErrorEquals": ["States.ALL"], "Assign": {"error": "{% $states.errorOutput %}", "step": "pull parts 2+"}, "Next": "NotifyFailure"}
+      ],
+      "Next": "BuildProcessed"
+    },
+    "BuildProcessed": {
+      "Type": "Task",
+      "Comment": "Rebuild the day from all the raw parts (no API calls), check it, upload processed and publish the result",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "${ExtractFunctionArn}",
+        "Payload": "{% {'date': $date, 'from_raw': true} %}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {"ErrorEquals": ["ReportedFailure"], "Next": "Failed"},
+        {"ErrorEquals": ["States.ALL"], "Assign": {"error": "{% $states.errorOutput %}", "step": "build processed"}, "Next": "NotifyFailure"}
+      ],
+      "End": true
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Comment": "Same message format as the extract script's own failure message, so the Teams notifier shows its card",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Arguments": {
+        "TopicArn": "${TopicArn}",
+        "Subject": "{% 'Coldstone ${CountryUpper} failed: ' & $date %}",
+        "Message": "{% $string({'source': 'coldstone-pipeline', 'stage': 'extract', 'country': '${Country}', 'status': 'failed', 'mode': $input.full_history = true ? 'full_history' : 'd-1', 'business_date': $date, 'finished_at': $now(), 'job_run_id': $states.context.Execution.Name, 'row_counts': {}, 'problems': [$step & ' failed: ' & $error.Error & ': ' & $substring($string($error.Cause), 0, 700)]}) %}"
+      },
+      "Next": "Failed"
+    },
+    "Failed": {
+      "Type": "Fail",
+      "Error": "ExtractFailed",
+      "Cause": "See the failed step above; a Teams card has been posted"
+    }
+  }
+}

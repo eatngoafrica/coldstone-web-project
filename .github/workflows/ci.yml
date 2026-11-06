@@ -16,8 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.9 = AWS Glue Python shell (extract and load jobs); 3.14 = the Lambdas
-        python: ["3.9", "3.14"]
+        # 3.14 = the Lambda runtime (template.yaml)
+        python: ["3.14"]
     steps:
       - uses: actions/checkout@v4
 
@@ -31,10 +31,16 @@ jobs:
         run: pip install -r requirements-ci.txt
 
       - name: Syntax check (compile every deployed script)
-        run: python -m py_compile extract_prod.py extract_prod_ng.py extract_prod_ky.py load_redshift.py lambda/*/handler.py
+        run: python -m py_compile extract_prod.py extract_prod_ng.py extract_prod_ky.py load_redshift.py lambda/*/*.py deploy/*.py
 
       - name: Lint (undefined names, unused imports, syntax errors)
-        run: ruff check --select E9,F --target-version py39 --output-format github extract_prod.py extract_prod_ng.py extract_prod_ky.py load_redshift.py lambda tests
+        run: ruff check --select E9,F --target-version py312 --output-format github extract_prod.py extract_prod_ng.py extract_prod_ky.py load_redshift.py lambda deploy tests
 
       - name: Tests
         run: pytest -v tests
+
+      - name: Check the SAM template (template.yaml)
+        run: cfn-lint template.yaml
+
+      - name: Assemble the Lambda code folders (as the deploy does, without the layer's packages)
+        run: python deploy/build_lambdas.py --no-deps

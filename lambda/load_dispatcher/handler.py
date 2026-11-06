@@ -1,24 +1,25 @@
 """Start Coldstone Redshift loads from the SQS load queue (coldstone-load-queue).
 
 Two kinds of message arrive (raw message delivery, so the body is the JSON itself):
-  * an extract job's success, forwarded by an SNS subscription filtered to stage=extract, status=success:
+  * an extract's success, forwarded by an SNS subscription filtered to stage=extract, status=success:
       {"source": "coldstone-pipeline", "stage": "extract", "status": "success", "country": "ng",
        "business_date": "2026-10-14", ...}                                   -> attempt 1
   * a load that hit temporary Redshift errors and re-queued itself with a 10-minute delay (load_redshift.py):
       {"source": "coldstone-load-requeue", "country": "ng", "business_date": "2026-10-14", "attempt": 2}
 
-Each one starts the Glue job coldstone-load-<country> with --date and --ATTEMPT. If that job is already running
-(it allows one run at a time) or Glue can't start it right now, the message is left on the queue and comes back
-after the queue's visibility timeout (10 minutes). After the queue's maximum receives it moves to the dead-letter
-queue, which has its own alarm.
+Each one invokes the Lambda coldstone-load-<country> asynchronously with {"date": ..., "attempt": ...}. Each load
+Lambda has a concurrency of 1, so a load that arrives while the country's previous one is still running waits in
+Lambda's own queue (up to 6 hours) instead of clashing with it on the staging tables. If the invoke itself fails, the
+message is left on the queue and comes back after the queue's visibility timeout (10 minutes); after the queue's
+maximum receives it moves to the dead-letter queue, which has its own alarm.
 
 Environment variables:
-    LOAD_JOB_PREFIX   Glue job name before the country code (default: coldstone-load-)
+    LOAD_FUNCTION_PREFIX   load Lambda name before the country code (default: coldstone-load-)
 """
 import json, os
 import boto3
 
-glue = boto3.client("glue")
+lambda_client = boto3.client("lambda")
 COUNTRIES = {"ng", "ky"}
 
 
@@ -47,13 +48,10 @@ def lambda_handler(event, context):
                 print(f"Ignored a message that isn't a load request: {record['body'][:300]}")
                 continue
             country, day, attempt = request
-            job = f"{os.environ.get('LOAD_JOB_PREFIX', 'coldstone-load-')}{country}"
-            run = glue.start_job_run(JobName=job, Arguments={"--date": day, "--ATTEMPT": str(attempt)})
-            print(f"Started {job} for {day}, attempt {attempt}: {run['JobRunId']}")
-        except glue.exceptions.ConcurrentRunsExceededException:
-            # A load for this country is still running: leave the request queued and try again later
-            print(f"{record['messageId']}: load already running, left on the queue")
-            failed.append({"itemIdentifier": record["messageId"]})
+            function = f"{os.environ.get('LOAD_FUNCTION_PREFIX', 'coldstone-load-')}{country}"
+            lambda_client.invoke(FunctionName=function, InvocationType="Event",
+                                 Payload=json.dumps({"date": day, "attempt": attempt}).encode())
+            print(f"Started {function} for {day}, attempt {attempt}")
         except Exception as err:
             print(f"{record['messageId']}: could not start the load ({err}); left on the queue")
             failed.append({"itemIdentifier": record["messageId"]})

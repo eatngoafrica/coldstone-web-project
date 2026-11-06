@@ -1,6 +1,7 @@
-"""Coldstone Kenya production extract (AWS Glue Python shell): API -> S3 raw layer -> S3 processed layer.
+"""Coldstone Kenya production extract (AWS Lambda, run by Step Functions): API -> S3 raw layer -> S3 processed layer.
 
-Glue job parameters:
+Settings, as --NAME value arguments (on Lambda, lambda/pipeline/entry.py builds them from the function's environment
+and the event; run by hand, type them):
     --S3_BUCKET            required: landing bucket name (no s3://)
     --S3_PREFIX            folder in the bucket (default: coldstone_web_ky)
     --COLDSTONE_KEY_PARAM  SSM parameter holding the KY API key (default: COLDSTONE_KEY-KY)
@@ -9,7 +10,12 @@ Glue job parameters:
                            business date (default: yesterday), filed under that date. Load that date into
                            Redshift straight after; daily runs afterwards are D-1.
     --from-raw true        rebuild processed from the date's latest complete raw run, no API calls
-The job's role needs s3:PutObject on <prefix>/*, s3:GetObject and s3:ListBucket on <prefix>/raw/*, and
+    --part K --parts N     pull only share K of N of the API calls into raw (no processed files, no SNS message), so
+                           a day's pull fits in Lambda's 15 minutes. Part 1 pulls orders, customers, activity logs,
+                           discounts, roles, the branch list and its share of the branches; part K>1 pulls its share
+                           of the branch list part 1 recorded. Run the parts in order, then --from-raw true builds
+                           processed from all of them. The state machine coldstone-extract-<cc> does this daily.
+The role needs s3:PutObject on <prefix>/*, s3:GetObject and s3:ListBucket on <prefix>/raw/*, and
 ssm:GetParameter on the key parameter, and sns:Publish on the topic if --SNS_TOPIC_ARN is set.
     --SNS_TOPIC_ARN        optional: publish the run's result (row counts / problems) for the Teams card
 
@@ -20,7 +26,7 @@ overlapping runs safe. Chowdeck orders are handled by a separate pipeline and ar
 Layers (under S3_PREFIX, both filed under the business date):
     raw/business_date=D/<endpoint>.jsonl.gz
         every API response exactly as received, one line per request, plus manifest.json saying whether
-        the run completed. A rerun replaces the date's files (the bucket's versioning keeps the previous copy
+        the run completed. A pull split into parts adds <endpoint>.partK.jsonl.gz and manifest.partK.json per part. A rerun replaces the date's files (the bucket's versioning keeps the previous copy
         for 30 days). Raw holds whole API pages, so it includes records outside the window; the
         transform filters them out.
     processed/<table>/business_date=D/<table>.parquet
@@ -41,7 +47,9 @@ COUNTRY = 'ky'
 BASE = "https://api.coldstonecreamery.co.ke/v1/public"
 NAIROBI = timezone(timedelta(hours=3))  # EAT, no daylight saving
 PAGE_SIZE = 200
-DELAY = 1.1  # seconds between requests, keeps us under 60 req/min
+# Seconds from the start of one request to the start of the next: about 57 a minute, under the API's 60 a minute.
+# Counted from the start, so the API's own response time (about 0.5 s) is part of the gap, not added to it.
+DELAY = 1.05
 RETRIES = 5
 # The API always sorts newest-created first (sortBy is ignored), so records created before the cutoff
 # but updated after it are only found by paging further back. Orders, customers and wallet transactions
@@ -49,7 +57,7 @@ RETRIES = 5
 UPDATE_LOOKBACK_DAYS = 3
 # --full-history cutoff: earlier than any Coldstone record, so every page is pulled
 HISTORY_START = datetime(2000, 1, 1, tzinfo=timezone.utc)
-# Glue's local disk is temporary: files are written here, then uploaded
+# Lambda's local disk (/tmp) is temporary: files are written here, then uploaded
 WORK_DIR = os.path.join(tempfile.gettempdir(), "coldstone_web_ky")
 
 # Parquet types match the Redshift column types, so COPY needs no conversion
@@ -138,21 +146,24 @@ def true_or_false(value):
 
 
 def load_settings(argv):
-    # Glue passes job parameters as --NAME value, plus arguments of its own (--JOB_ID, --scriptLocation...)
-    # that are ignored here
+    # Settings arrive as --NAME value; unknown arguments are ignored
     parser = argparse.ArgumentParser()
     parser.add_argument("--S3_BUCKET", required=True)
     parser.add_argument("--S3_PREFIX", default="coldstone_web_ky")
     parser.add_argument("--COLDSTONE_KEY_PARAM", default="COLDSTONE_KEY-KY")
     parser.add_argument("--SNS_TOPIC_ARN")
-    parser.add_argument("--JOB_RUN_ID")  # passed by Glue; included in the alert
+    parser.add_argument("--JOB_RUN_ID")  # the Lambda request id; included in the alert
     parser.add_argument("--date", help="business date YYYY-MM-DD in Nairobi time (default: yesterday)")
-    # Glue job parameters always carry a value, so --from-raw takes an optional true/false
+    # Settings built from the environment always carry a value, so --from-raw takes an optional true/false
     parser.add_argument("--full-history", nargs="?", const="true", default="false", type=true_or_false,
                         help="true: one-off initial load, every record from the first order to the end of the date")
     parser.add_argument("--from-raw", nargs="?", const="true", default="false", type=true_or_false,
                         help="true: rebuild processed files from the date's latest complete raw run, no API calls")
+    parser.add_argument("--part", type=int, help="pull only this share of the API calls into raw (1 = first)")
+    parser.add_argument("--parts", type=int, default=1, help="how many shares the pull is split into")
     args, _ = parser.parse_known_args(argv)
+    if args.part is not None and not 1 <= args.part <= args.parts:
+        parser.error(f"--part {args.part} is outside 1..{args.parts}")
     # Tolerate "s3://bucket/" or stray spaces typed into the console
     args.S3_BUCKET = args.S3_BUCKET.strip().removeprefix("s3://").strip("/")
     args.S3_PREFIX = args.S3_PREFIX.strip().strip("/")
@@ -217,17 +228,18 @@ def changed_since(record, cutoff):
 
 class RawRecorder:
     # Saves every API response untouched, one gzipped JSON Lines file per endpoint, streamed to disk so the
-    # big menu pulls never sit in memory. manifest.json marks whether the run finished.
-    def __init__(self, root, business_date, run_id, mode):
+    # big menu pulls never sit in memory. manifest.json marks whether the run finished. A pull split into parts
+    # records part K>1 with suffix ".partK" (orders.part2.jsonl.gz, manifest.part2.json) beside part 1's files.
+    def __init__(self, root, business_date, run_id, mode, suffix=""):
         # One folder per business date: a rerun overwrites the same files (S3 versioning keeps the old copy)
         self.rel_dir = f"raw/business_date={business_date:%Y-%m-%d}"
         self.dir = os.path.join(root, *self.rel_dir.split("/"))
-        self.business_date, self.run_id, self.mode = business_date, run_id, mode
+        self.business_date, self.run_id, self.mode, self.suffix = business_date, run_id, mode, suffix
         self.handles, self.requests = {}, 0
         os.makedirs(self.dir, exist_ok=True)
 
     def record(self, path, params, body):
-        name = path.replace("/", "_")
+        name = path.replace("/", "_") + self.suffix
         if name not in self.handles:
             self.handles[name] = gzip.open(os.path.join(self.dir, f"{name}.jsonl.gz"), "wt", encoding="utf-8")
         line = {"path": path, "params": params, "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -235,30 +247,41 @@ class RawRecorder:
         self.handles[name].write(json.dumps(line, ensure_ascii=False) + "\n")
         self.requests += 1
 
-    def close(self, complete):
+    def close(self, complete, **extra):
+        # Returns only the files this run wrote, so leftovers from an earlier run in the folder aren't uploaded
         for h in self.handles.values():
             h.close()
         manifest = {"business_date": f"{self.business_date:%Y-%m-%d}", "run_id": self.run_id,
                     "mode": self.mode, "complete": complete, "requests": self.requests,
-                    "endpoints": sorted(f"{n}.jsonl.gz" for n in self.handles)}
-        with open(os.path.join(self.dir, "manifest.json"), "w", encoding="utf-8") as f:
+                    "endpoints": sorted(f"{n}.jsonl.gz" for n in self.handles), **extra}
+        names = [f"{n}.jsonl.gz" for n in self.handles] + [f"manifest{self.suffix}.json"]
+        with open(os.path.join(self.dir, names[-1]), "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
-        return {f"{self.rel_dir}/{n}": os.path.join(self.dir, n) for n in os.listdir(self.dir)
-                if os.path.isfile(os.path.join(self.dir, n))}
+        return {f"{self.rel_dir}/{n}": os.path.join(self.dir, n) for n in names}
+
+
+def chained_lines(files):
+    for file in files:
+        if os.path.exists(file):
+            with gzip.open(file, "rt", encoding="utf-8") as f:
+                yield from f
 
 
 class RawReplay:
     # Serves saved responses instead of calling the API (--from-raw). The fetch logic asks each endpoint for
     # the same pages in the same order as when they were recorded, so every endpoint file is read one line
-    # at a time as requests arrive: memory stays small however big the day's menus are.
-    def __init__(self, run_dir):
-        self.dir, self.readers = run_dir, {}
+    # at a time as requests arrive: memory stays small however big the day's menus are. A pull split into
+    # parts is read as one: each endpoint's part 1 file, then part 2's, and so on, which is the order a single
+    # pull would have made the requests in (the parts share the branch list in order).
+    def __init__(self, run_dir, parts=1):
+        self.dir, self.parts, self.readers = run_dir, parts, {}
 
     def response(self, path, params):
         name = path.replace("/", "_")
         if name not in self.readers:
-            file = os.path.join(self.dir, f"{name}.jsonl.gz")
-            self.readers[name] = gzip.open(file, "rt", encoding="utf-8") if os.path.exists(file) else iter(())
+            self.readers[name] = chained_lines([os.path.join(self.dir, f"{name}.jsonl.gz")] +
+                                               [os.path.join(self.dir, f"{name}.part{k}.jsonl.gz")
+                                                for k in range(2, self.parts + 1)])
         line = next(self.readers[name], None)
         x = json.loads(line) if line else None
         if not x or x["path"] != path or x["params"] != params:
@@ -289,10 +312,23 @@ def retry_after(value, default=30):
             return default
 
 
+_last_request = 0.0  # time.monotonic() when the last request started
+
+
+def pace():
+    # Waits until DELAY seconds have passed since the previous request started
+    global _last_request
+    wait = _last_request + DELAY - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _last_request = time.monotonic()
+
+
 def get(path, **params):
     if isinstance(_raw, RawReplay):
         return fix_ids(_raw.response(path, params))["data"]
     for attempt in range(1, RETRIES + 1):
+        pace()
         try:
             r = requests.get(f"{BASE}/{path}", headers=headers(), params=params, timeout=60)
         except (requests.ConnectionError, requests.Timeout) as err:
@@ -310,7 +346,6 @@ def get(path, **params):
             print(f"  {path}: HTTP {r.status_code}, retry {attempt}")
             time.sleep(5 * attempt)
             continue
-        time.sleep(DELAY)
         r.raise_for_status()
         body = r.json()
         if _raw:
@@ -454,6 +489,34 @@ def latest_raw_run(business_date, root, bucket, prefix):
         if not json.load(f)["complete"]:
             raise SystemExit(f"--from-raw: the raw run for {business_date:%Y-%m-%d} did not complete; pull from the API instead")
     return local
+
+
+def raw_parts(run_dir, manifest):
+    # For a pull split into parts: checks every part finished and belongs to the same run as part 1 (a rerun of
+    # part 1 alone would otherwise be mixed with an older part 2). Returns how many parts to read.
+    parts = manifest.get("parts", 1)
+    for k in range(2, parts + 1):
+        path = os.path.join(run_dir, f"manifest.part{k}.json")
+        if not os.path.exists(path):
+            raise SystemExit(f"--from-raw: part {k} of {parts} of the raw run for {manifest['business_date']} is "
+                             f"missing; run every part again, in order")
+        with open(path, encoding="utf-8") as f:
+            m = json.load(f)
+        if not m["complete"] or m["run_id"] != manifest["run_id"]:
+            raise SystemExit(f"--from-raw: part {k} of {parts} of the raw run for {manifest['business_date']} "
+                             f"{'did not complete' if not m['complete'] else 'is from an earlier run'}; "
+                             f"run every part again, in order")
+    return parts
+
+
+def first_part_manifest(business_date, bucket, prefix):
+    # Part K>1 of a split pull reads part 1's manifest from S3 for the run id and the branch list
+    key = f"{prefix}/raw/business_date={business_date:%Y-%m-%d}/manifest.json"
+    try:
+        body = boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read()
+    except Exception as err:
+        raise SystemExit(f"--part: could not read part 1's manifest s3://{bucket}/{key} ({err}); run part 1 first")
+    return json.loads(body)
 
 def publish(args, business_date, mode, status, t, problems):
     # Sends the run's result to SNS for the Teams card. An SNS outage must not fail a good load, so errors
@@ -628,7 +691,18 @@ def add_wallet_tx(t, x):
 
 # ---------- main ----------
 
-def extract(t, cutoff):
+def extract(t, cutoff, part=1, parts=1, branches=None):
+    # Returns the branch list. part / parts: one share of a pull split into several runs (see --part). Part 1
+    # makes the account-wide calls and fetches the branch list; part K>1 is given that list (branches) and only
+    # makes the branch-scoped calls. Each part takes its own contiguous slice of the branches, in order.
+    if part == 1:
+        branches = extract_account(t, cutoff)
+    lo, hi = (part - 1) * len(branches) // parts, part * len(branches) // parts
+    extract_branches(t, cutoff, branches, lo, hi)
+    return branches
+
+
+def extract_account(t, cutoff):
     # Transactions: incremental. Orders, customers and wallet transactions page back further for late updates.
     for path, list_key, builder, lookback in [("orders", "orders", add_order, UPDATE_LOOKBACK_DAYS),
                                               ("customers", "users", add_customer, UPDATE_LOOKBACK_DAYS),
@@ -655,12 +729,27 @@ def extract(t, cutoff):
         add_branch(t, x)
     print(f"branches: {len(all_branches)} (full)")
 
-    # Branch-scoped endpoints: menu, staff and wallets in full; wallet transactions incremental
-    for n, branch in enumerate(all_branches, 1):
+    # Staff: the headquarters branch's members call returns every branch's staff (checked on 2026-11-06 for NG: 117
+    # of 117 people across 83 branches; the other 85 calls only repeated people already in it, differing only in
+    # lastSeenAt), so one call replaces one per branch. If the headquarters call ever stops covering other
+    # branches, each branch is asked instead, as before.
+    hq = next((x["_id"] for x in all_branches if x.get("isHeadquarters")), None)
+    members = fetch_all("members", None, branchId=hq) if hq else []
+    if len(all_branches) > 1 and len({ref(x.get("branch")) for x in members}) < 2:
+        print("members: the headquarters call didn't return other branches' staff; asking each branch")
+        members = [x for branch in all_branches for x in fetch_all("members", None, branchId=branch["_id"])]
+    for x in members:
+        add_member(t, x)
+    print(f"members: {len(members)} (full)")
+    return all_branches
+
+
+def extract_branches(t, cutoff, all_branches, lo=0, hi=None):
+    # Branch-scoped endpoints: menu and wallets in full; wallet transactions incremental (staff: extract_account)
+    hi = len(all_branches) if hi is None else hi
+    for n, branch in enumerate(all_branches[lo:hi], lo + 1):
         bid = branch["_id"]
-        print(f"[{n}/{len(all_branches)}] {branch['name'].strip()}")
-        for x in fetch_all("members", None, branchId=bid):
-            add_member(t, x)
+        print(f"[{n}/{len(all_branches)}] {(branch.get('name') or '').strip()}")
         for x in fetch_all("menus", "products", branchId=bid):
             add_menu_item(t, x)
         for x in fetch_all("modifiers", "products", branchId=bid):
@@ -695,11 +784,14 @@ def main():
     if args.from_raw:
         run_dir = latest_raw_run(start, root, bucket, prefix)
         with open(os.path.join(run_dir, "manifest.json"), encoding="utf-8") as f:
-            if json.load(f).get("mode") == "full_history":
-                cutoff = HISTORY_START  # replay with the same window the run was recorded with
-                mode = 'full_history'
-        print(f"Business date {start:%Y-%m-%d}: rebuilding from raw run {os.path.basename(run_dir)} (no API calls)\n")
-        _raw = RawReplay(run_dir)
+            manifest = json.load(f)
+        if manifest.get("mode") == "full_history":
+            cutoff = HISTORY_START  # replay with the same window the run was recorded with
+            mode = 'full_history'
+        parts = raw_parts(run_dir, manifest)
+        print(f"Business date {start:%Y-%m-%d}: rebuilding from raw run {manifest['run_id']}"
+              f"{f' ({parts} parts)' if parts > 1 else ''} (no API calls)\n")
+        _raw = RawReplay(run_dir, parts)
         extract(t, cutoff)
     else:
         if args.full_history:
@@ -710,6 +802,9 @@ def main():
         else:
             print(f"Business date {start:%Y-%m-%d}: pulling records created or updated since "
                   f"{start:%Y-%m-%d %H:%M} Nairobi ({cutoff:%Y-%m-%d %H:%M} UTC)\n")
+        if args.part is not None:
+            pull_part(args, start, cutoff, mode)
+            return
         _raw = RawRecorder(root, start, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
                            "full_history" if args.full_history else "d-1")
         complete = False
@@ -741,6 +836,33 @@ def main():
     print("\nData quality checks passed")
     upload(files, bucket, prefix, "processed")
     publish(args, start, mode, 'success', t, [])
+
+
+def pull_part(args, start, cutoff, mode):
+    # One share of a split pull (--part K --parts N), saved to raw only. Checks, processed files and the SNS
+    # message come afterwards from the --from-raw run that reads every part.
+    global _raw
+    part, parts = args.part, args.parts
+    branches, run_id = None, datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if part > 1:
+        first = first_part_manifest(start, args.S3_BUCKET, args.S3_PREFIX)
+        if not first.get("complete") or first.get("parts") != parts or first.get("mode") != mode:
+            raise SystemExit(f"--part {part}: part 1 for {start:%Y-%m-%d} is not a finished {mode} pull in "
+                             f"{parts} parts (manifest: complete={first.get('complete')}, parts={first.get('parts')}, "
+                             f"mode={first.get('mode')}); run part 1 first")
+        branches, run_id = first["branches"], first["run_id"]
+    print(f"Part {part} of {parts} (raw only)\n")
+    _raw = RawRecorder(WORK_DIR, start, run_id, mode, "" if part == 1 else f".part{part}")
+    complete, extra = False, {"part": part, "parts": parts}
+    try:
+        branches = extract(Tables(), cutoff, part, parts, branches)
+        complete = True
+        if part == 1:
+            extra["branches"] = [{"_id": x["_id"], "name": x.get("name") or ""} for x in branches]
+    finally:
+        raw_files = _raw.close(complete, **extra)
+        print(f"\nRaw: {_raw.requests} API responses saved (part {part} of {parts})")
+        upload(raw_files, args.S3_BUCKET, args.S3_PREFIX, "raw")
 
 
 def check_quality(t):
