@@ -7,7 +7,8 @@
       "Action": [
         "cloudformation:CreateChangeSet", "cloudformation:ExecuteChangeSet", "cloudformation:DescribeChangeSet",
         "cloudformation:DeleteChangeSet", "cloudformation:DescribeStacks", "cloudformation:DescribeStackEvents",
-        "cloudformation:GetTemplateSummary", "cloudformation:GetTemplate", "cloudformation:ListStackResources"
+        "cloudformation:GetTemplateSummary", "cloudformation:GetTemplate", "cloudformation:ListStackResources",
+        "cloudformation:DeleteStack"
       ],
       "Resource": [
         "arn:aws:cloudformation:us-east-1:655103423742:stack/coldstone-pipeline/*",
