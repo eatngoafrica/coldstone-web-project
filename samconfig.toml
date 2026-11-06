@@ -1,5 +1,5 @@
 # Settings for `sam deploy` (run by .github/workflows/deploy.yml, or by hand after `python deploy/build_lambdas.py`).
-# Fill in every CHANGE_ME with the values the Glue jobs used: AWS Glue > ETL jobs > the job > Job details >
+# The values below came from the Glue jobs: AWS Glue > ETL jobs > the job > Job details >
 # Advanced properties > Job parameters. None of these are secrets (the API keys stay in SSM).
 version = 0.1
 

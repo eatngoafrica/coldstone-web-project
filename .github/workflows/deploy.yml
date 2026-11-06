@@ -52,7 +52,7 @@ jobs:
       - name: Pre-flight checks
         run: |
           set -euo pipefail
-          if grep -n CHANGE_ME samconfig.toml; then
+          if grep -nE '(=|")CHANGE_ME' samconfig.toml; then  # a value, not a comment
             echo "::error::samconfig.toml still has CHANGE_ME values; fill them in from the Glue jobs' parameters"
             exit 1
           fi
