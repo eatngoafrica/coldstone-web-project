@@ -1,25 +1,25 @@
-"""Post Coldstone pipeline notifications from SNS to a Microsoft Teams channel.
+"""Route Coldstone pipeline notifications: the day's "loaded and ready" card to Teams, everything else to email.
 
-Subscribed to the pipeline's SNS topic. Handles these kinds of message:
-  * results published by the Redshift load jobs (load_redshift.py, "stage": "load"): "loaded and ready" with
-    basic KPIs for the day, or the load's error
-  * results published by the extract jobs (extract_prod_ng.py / extract_prod_ky.py), e.g.
-      {"source": "coldstone-pipeline", "country": "ng", "mode": "d-1", "status": "success",
-       "business_date": "2026-10-13", "finished_at": "2026-10-14T04:28:00Z", "job_run_id": "jr_...",
-       "row_counts": {"orders": 109, ...}, "problems": []}
-  * extract failures the scripts couldn't report themselves (API errors, timeouts), published in the same
-    format by the state machines coldstone-extract-<cc>
+Subscribed to the pipeline's SNS topic (coldstone-pipeline-alerts). Only one kind of message goes to Teams:
+  * a successful Redshift load (load_redshift.py, "stage": "load", "status": "success"): "loaded and ready" with
+    basic KPIs for the day, one card per country per day
+Everything that needs someone's attention is sent as a plain-text email through the ops topic
+(coldstone-ops-alerts, whose subscriber is the pipeline owner's mailbox):
+  * a failed load, or one re-queued because Redshift was busy
+  * a failed extract, published by the extract script (data checks) or by the state machine coldstone-extract-<cc>
+    (API errors, timeouts)
   * Lambda failure destination records from the load Lambdas: a load that timed out, crashed or never started.
     Errors of type ReportedFailure are skipped: the load already published those itself
-  * CloudWatch alarm notifications
+  * CloudWatch alarm notifications, and any other message
+A successful extract sends nothing (its load's card follows), unless EXTRACT_SUCCESS_CARDS=on.
 
 Environment variables:
     TEAMS_WEBHOOK_PARAM    SSM Parameter Store (SecureString) name holding the Teams Workflows webhook URL
-    EXTRACT_SUCCESS_CARDS  on (default) / off. Off = one report per country per day: successful extracts post
-                           nothing and only the final Redshift "loaded and ready" card appears. Failures always post.
-A failed post raises, so Lambda's async retries try again.
+    OPS_TOPIC_ARN          SNS topic for the emails (default: coldstone-ops-alerts in the same account and region)
+    EXTRACT_SUCCESS_CARDS  off (default) / on: also post a Teams card when an extract succeeds
+A failed post or email raises, so Lambda's async retries try again.
 """
-import json, os, urllib.request
+import json, os, re, urllib.request
 from datetime import datetime, timedelta, timezone
 import boto3
 
@@ -214,6 +214,50 @@ def post(body):
             raise RuntimeError(f"Teams webhook returned HTTP {r.status}")
 
 
+def card_text(body):
+    # The same card as plain text, for email
+    lines = []
+    for block in body:
+        if block.get("type") == "TextBlock" and block.get("text"):
+            lines.append(block["text"])
+        elif block.get("type") == "FactSet":
+            lines += [f"{f['title'].strip()}: {f['value']}" for f in block.get("facts", [])]
+        lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def ops_topic(incoming_topic_arn):
+    # coldstone-ops-alerts beside the topic the message came from, unless OPS_TOPIC_ARN says otherwise
+    return os.environ.get("OPS_TOPIC_ARN") or incoming_topic_arn.rsplit(":", 1)[0] + ":coldstone-ops-alerts"
+
+
+def email(topic_arn, body):
+    # SNS email subjects must be plain ASCII under 100 characters, so the card title loses its emoji there
+    subject = re.sub(r"[^\x20-\x7e]", "", body[0].get("text", "")).strip() or "Coldstone pipeline alert"
+    boto3.client("sns").publish(TopicArn=topic_arn, Subject=subject[:99], Message=card_text(body))
+
+
+def route(msg, sns):
+    # Returns ("teams" | "email" | None, card body)
+    if isinstance(msg, dict) and msg.get("source") == "coldstone-pipeline" and msg.get("stage") == "load":
+        return ("teams" if msg.get("status") == "success" else "email"), load_card(msg)
+    if isinstance(msg, dict) and msg.get("source") == "coldstone-pipeline":
+        if msg.get("status") != "success":
+            return "email", pipeline_card(msg)
+        if os.environ.get("EXTRACT_SUCCESS_CARDS", "off").lower() == "on":
+            return "teams", pipeline_card(msg)
+        print(f"Extract success for {msg.get('country')} {msg.get('business_date')}: nothing sent, the load's card follows")
+        return None, None
+    if isinstance(msg, dict) and "requestContext" in msg and "requestPayload" in msg:
+        if (msg.get("responsePayload") or {}).get("errorType") == "ReportedFailure":
+            print("Load failure already reported by the load itself: nothing sent")
+            return None, None
+        return "email", lambda_failure_card(msg)
+    if isinstance(msg, dict) and "AlarmName" in msg:
+        return "email", alarm_card(msg)
+    return "email", text_card(sns.get("Subject"), sns["Message"])
+
+
 def lambda_handler(event, context):
     for record in event.get("Records", []):
         sns = record["Sns"]
@@ -221,21 +265,12 @@ def lambda_handler(event, context):
             msg = json.loads(sns["Message"])
         except (TypeError, ValueError):
             msg = None
-        if isinstance(msg, dict) and msg.get("source") == "coldstone-pipeline" and msg.get("stage") == "load":
-            post(load_card(msg))
-        elif isinstance(msg, dict) and msg.get("source") == "coldstone-pipeline":
-            # One report per country per day: once the Redshift load jobs run, set EXTRACT_SUCCESS_CARDS=off so
-            # a good extract stays quiet and only the final "loaded and ready" card is posted. Failures always post.
-            if msg.get("status") == "success" and os.environ.get("EXTRACT_SUCCESS_CARDS", "on").lower() == "off":
-                print(f"Extract success for {msg.get('country')} {msg.get('business_date')}: card skipped")
-                continue
-            post(pipeline_card(msg))
-        elif isinstance(msg, dict) and "requestContext" in msg and "requestPayload" in msg:
-            if (msg.get("responsePayload") or {}).get("errorType") == "ReportedFailure":
-                print("Load failure already reported by the load itself: card skipped")
-                continue
-            post(lambda_failure_card(msg))
-        elif isinstance(msg, dict) and "AlarmName" in msg:
-            post(alarm_card(msg))
-        else:
-            post(text_card(sns.get("Subject"), sns["Message"]))
+        where, body = route(msg, sns)
+        if where == "teams":
+            post(body)
+        elif where == "email":
+            topic = ops_topic(sns.get("TopicArn", ""))
+            if topic == sns.get("TopicArn"):  # never mail back into the topic this Lambda listens to
+                raise RuntimeError(f"OPS_TOPIC_ARN is the notifier's own topic ({topic})")
+            email(topic, body)
+            print(f"Emailed: {body[0].get('text', '')[:120]}")

@@ -43,6 +43,13 @@ Parameters:
   DispatcherRoleName:
     Type: String
     Description: Name of the existing coldstone-load-dispatcher Lambda's IAM role (Configuration > Permissions); it is given permission to invoke the load Lambdas
+  NotifierRoleName:
+    Type: String
+    Description: Name of the existing coldstone-teams-notifier Lambda's IAM role (Configuration > Permissions); it is given permission to email through the ops topic
+  OpsTopicName:
+    Type: String
+    Default: coldstone-ops-alerts
+    Description: Existing SNS topic whose email subscribers get every failure (the notifier sends there)
   NgParts:
     Type: Number
     Default: 2
@@ -350,6 +357,19 @@ Resources:
           - Effect: Allow
             Action: lambda:InvokeFunction
             Resource: [!GetAtt LoadNg.Arn, !GetAtt LoadKy.Arn]
+
+  # The existing Teams notifier keeps its own role; this lets it send failures as emails through the ops topic
+  NotifierEmailsOps:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref NotifierRoleName
+      PolicyName: coldstone-email-ops-alerts
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: sns:Publish
+            Resource: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${OpsTopicName}
 
 Outputs:
   ExtractNgStateMachine:
