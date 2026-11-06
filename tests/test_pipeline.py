@@ -132,30 +132,74 @@ def test_notifier_country_of(job, country):
     assert notifier.country_of(job) == country
 
 
-def test_notifier_skips_extract_success_when_off(monkeypatch):
-    posted = []
-    monkeypatch.setattr(notifier, "post", posted.append)
-    monkeypatch.setenv("EXTRACT_SUCCESS_CARDS", "off")
-    msg = {"source": "coldstone-pipeline", "stage": "extract", "status": "success", "country": "ng",
-           "business_date": "2026-10-14", "row_counts": {}, "problems": []}
-    notifier.lambda_handler({"Records": [{"Sns": {"Message": json.dumps(msg), "Subject": "x"}}]}, None)
-    assert posted == []
+PIPELINE_TOPIC = "arn:aws:sns:us-east-1:655103423742:coldstone-pipeline-alerts"
 
 
-@pytest.mark.parametrize("msg", [
-    {"source": "coldstone-pipeline", "stage": "extract", "status": "success", "country": "ky", "mode": "d-1",
-     "business_date": "2026-10-14", "finished_at": "2026-10-15T04:28:00Z", "job_run_id": "jr_1",
-     "row_counts": {"orders": 109}, "problems": []},
-    {"source": "coldstone-pipeline", "stage": "extract", "status": "failed", "country": "ng",
-     "business_date": "2026-10-14", "row_counts": {}, "problems": ["orders: API error"]},
+def notify(monkeypatch, msg, subject="x"):
+    """Runs the notifier on one SNS message; returns (Teams cards, emails as (topic, subject, text))"""
+    teams, emails = [], []
+
+    class FakeSNS:
+        def publish(self, TopicArn, Subject, Message):
+            emails.append((TopicArn, Subject, Message))
+
+    monkeypatch.setattr(notifier, "post", teams.append)
+    monkeypatch.setattr(notifier.boto3, "client", lambda service: FakeSNS())
+    monkeypatch.delenv("OPS_TOPIC_ARN", raising=False)
+    body = msg if isinstance(msg, str) else json.dumps(msg)
+    notifier.lambda_handler({"Records": [{"Sns": {"Message": body, "Subject": subject,
+                                                  "TopicArn": PIPELINE_TOPIC}}]}, None)
+    return teams, emails
+
+
+LOAD_SUCCESS = {"source": "coldstone-pipeline", "stage": "load", "status": "success", "country": "ng",
+                "business_date": "2026-11-04", "kpis": {"orders": 12, "sales_minor": 500000, "sales_orders": 10}}
+
+
+def test_notifier_sends_only_the_load_success_to_teams(monkeypatch):
+    teams, emails = notify(monkeypatch, LOAD_SUCCESS)
+    assert len(teams) == 1 and emails == []
+    assert "loaded into Redshift and ready to use" in json.dumps(teams[0], ensure_ascii=False)
+
+
+@pytest.mark.parametrize("msg, words", [
+    (dict(LOAD_SUCCESS, status="failed", error="COPY failed: Cannot find default IAM role"), "Cannot find default IAM role"),
+    (dict(LOAD_SUCCESS, status="queued", error="Redshift busy", next_attempt=2, max_attempts=3), "queued"),
+    ({"source": "coldstone-pipeline", "stage": "extract", "status": "failed", "country": "ky",
+      "business_date": "2026-11-04", "row_counts": {}, "problems": ["pull part 1 failed: Sandbox.Timedout"]},
+     "Sandbox.Timedout"),
+    ({"AlarmName": "coldstone-load-requests-stuck", "NewStateValue": "ALARM", "AlarmDescription": "stuck",
+      "NewStateReason": "Threshold crossed", "StateChangeTime": "2026-11-05T08:37:00.000+0000"},
+     "coldstone-load-requests-stuck"),
+    ("plain text from somewhere", "plain text from somewhere"),
 ])
-def test_notifier_builds_extract_cards(monkeypatch, msg):
-    posted = []
-    monkeypatch.setattr(notifier, "post", posted.append)
-    monkeypatch.setenv("EXTRACT_SUCCESS_CARDS", "on")
-    notifier.lambda_handler({"Records": [{"Sns": {"Message": json.dumps(msg), "Subject": "x"}}]}, None)
-    assert len(posted) == 1
-    json.dumps(posted[0])  # the card must be valid JSON for Teams
+def test_notifier_emails_everything_else(monkeypatch, msg, words):
+    teams, emails = notify(monkeypatch, msg)
+    assert teams == [] and len(emails) == 1
+    topic, subject, text = emails[0]
+    assert topic == "arn:aws:sns:us-east-1:655103423742:coldstone-ops-alerts"
+    assert words in text and "{" not in text.split("\n")[0], "a readable email, not JSON"
+    assert subject.isascii() and 0 < len(subject) < 100, "SNS email subjects must be short ASCII"
+
+
+@pytest.mark.parametrize("setting, cards", [(None, 0), ("off", 0), ("on", 1)])
+def test_notifier_extract_success(monkeypatch, setting, cards):
+    if setting:
+        monkeypatch.setenv("EXTRACT_SUCCESS_CARDS", setting)
+    else:
+        monkeypatch.delenv("EXTRACT_SUCCESS_CARDS", raising=False)
+    msg = {"source": "coldstone-pipeline", "stage": "extract", "status": "success", "country": "ky", "mode": "d-1",
+           "business_date": "2026-11-04", "row_counts": {"orders": 9}, "problems": []}
+    teams, emails = notify(monkeypatch, msg)
+    assert len(teams) == cards and emails == []
+
+
+def test_notifier_never_emails_its_own_topic(monkeypatch):
+    monkeypatch.setenv("OPS_TOPIC_ARN", PIPELINE_TOPIC)
+    monkeypatch.setattr(notifier, "post", lambda body: None)
+    with pytest.raises(RuntimeError, match="own topic"):
+        notifier.lambda_handler({"Records": [{"Sns": {"Message": "x", "Subject": "x", "TopicArn": PIPELINE_TOPIC}}]},
+                                None)
 
 
 def fake_columns():
@@ -471,10 +515,9 @@ def test_dispatcher_invokes_the_country_load_lambda(monkeypatch):
     assert result == {"batchItemFailures": [{"itemIdentifier": "2"}]}
 
 
-@pytest.mark.parametrize("error_type, cards", [("ReportedFailure", 0), (None, 1)])
-def test_notifier_lambda_failure_destination(monkeypatch, error_type, cards):
-    posted = []
-    monkeypatch.setattr(notifier, "post", posted.append)
+@pytest.mark.parametrize("error_type, sent", [("ReportedFailure", 0), (None, 1)])
+def test_notifier_lambda_failure_destination(monkeypatch, error_type, sent):
+    # A load timeout is emailed; a failure the load already reported isn't sent twice
     payload = {"errorMessage": "Task timed out after 900.00 seconds"}
     if error_type:
         payload["errorType"] = error_type
@@ -482,10 +525,10 @@ def test_notifier_lambda_failure_destination(monkeypatch, error_type, cards):
            "requestContext": {"functionArn": "arn:aws:lambda:us-east-1:1:function:coldstone-load-ng:$LATEST",
                               "condition": "RetriesExhausted"},
            "requestPayload": {"date": "2026-11-04", "attempt": 1}, "responsePayload": payload}
-    notifier.lambda_handler({"Records": [{"Sns": {"Message": json.dumps(msg), "Subject": None}}]}, None)
-    assert len(posted) == cards
-    if cards:
-        text = json.dumps(posted[0])
+    teams, emails = notify(monkeypatch, msg, subject=None)
+    assert teams == [] and len(emails) == sent
+    if sent:
+        text = emails[0][2]
         assert "coldstone-load-ng" in text and "2026-11-04" in text and "timed out" in text
 
 
