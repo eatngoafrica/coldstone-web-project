@@ -43,9 +43,7 @@ Lambda code ([deploy/build_lambdas.py](deploy/build_lambdas.py)) and runs `sam d
    November 2026 the account's limit was 40 with 13 unreserved (Lambda console → Dashboard), so this only just fits;
    AWS keeps a minimum unreserved. If the deploy fails with "below its minimum value", it rolls back cleanly: ask
    AWS to raise "Concurrent executions" (Service Quotas → AWS Lambda) to the default 1000.
-5. **Encryption**: if the bucket, the SNS topic or the API key parameters use a customer-managed KMS key, compare
-   the Glue jobs' roles with template.yaml and add the matching `kms:` permissions.
-6. Push to `main`, or run the Deploy workflow by hand.
+5. Push to `main`, or run the Deploy workflow by hand.
 
 ## Running by hand
 
